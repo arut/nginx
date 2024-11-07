@@ -44,6 +44,7 @@
                     (pkt)->trunc);
 
 
+static ngx_uint_t ngx_quic_queue_empty(ngx_connection_t *c);
 static ngx_int_t ngx_quic_create_datagrams(ngx_connection_t *c);
 static void ngx_quic_commit_send(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx);
 static void ngx_quic_revert_send(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
@@ -93,6 +94,8 @@ ngx_quic_output(ngx_connection_t *c)
         return NGX_ERROR;
     }
 
+    ngx_quic_congestion_idle(c, ngx_quic_queue_empty(c));
+
     if (in_flight == cg->in_flight || qc->closing) {
         /* no ack-eliciting data was sent or we are done */
         return NGX_OK;
@@ -106,6 +109,27 @@ ngx_quic_output(ngx_connection_t *c)
     ngx_quic_set_lost_timer(c);
 
     return NGX_OK;
+}
+
+
+static ngx_uint_t
+ngx_quic_queue_empty(ngx_connection_t *c)
+{
+    ngx_uint_t              i;
+    ngx_quic_send_ctx_t    *ctx;
+    ngx_quic_connection_t  *qc;
+
+    qc = ngx_quic_get_connection(c);
+
+    for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
+        ctx = &qc->send_ctx[i];
+
+        if (!ngx_queue_empty(&ctx->frames)) {
+            return 0;
+        }
+    }
+
+    return 1;
 }
 
 
@@ -127,7 +151,7 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
     cg = &qc->congestion;
     path = qc->path;
 
-    while (cg->in_flight < cg->window) {
+    while (cg->in_flight <= cg->window) {
 
         p = dst;
 
@@ -228,8 +252,9 @@ ngx_quic_commit_send(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx)
         }
     }
 
-    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
-                   "quic congestion send if:%uz", cg->in_flight);
+    ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "quic congestion send t:%M cwnd:%uz if:%uz",
+                   ngx_current_msec, cg->window, cg->in_flight);
 }
 
 

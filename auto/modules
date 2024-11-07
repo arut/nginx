@@ -1354,7 +1354,7 @@ if [ $USE_OPENSSL_QUIC = YES ]; then
                      src/event/quic/ngx_event_quic_socket.c \
                      src/event/quic/ngx_event_quic_openssl_compat.c"
 
-    ngx_module_libs=
+    ngx_module_libs=-lm
     ngx_module_link=YES
     ngx_module_order=
 
