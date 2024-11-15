@@ -1841,6 +1841,10 @@ ngx_http_send_header(ngx_http_request_t *r)
         return NGX_ERROR;
     }
 
+    if (r->headers_out.status == NGX_HTTP_EARLY_HINTS) {
+        return ngx_http_top_early_hints_filter(r);
+    }
+
     if (r->err_status) {
         r->headers_out.status = r->err_status;
         r->headers_out.status_line.len = 0;
