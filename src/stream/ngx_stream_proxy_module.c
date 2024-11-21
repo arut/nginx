@@ -822,9 +822,9 @@ ngx_stream_proxy_init_upstream(ngx_stream_session_t *s)
 
 #if (NGX_STREAM_SSL)
 
-    if (pc->type == SOCK_STREAM && pscf->ssl_enable) {
+    if (pscf->ssl_enable) {
 
-        if (u->proxy_protocol) {
+        if (pc->type == SOCK_STREAM && u->proxy_protocol) {
             if (ngx_stream_proxy_send_proxy_protocol(s) != NGX_OK) {
                 return;
             }

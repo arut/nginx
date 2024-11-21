@@ -469,7 +469,9 @@ ngx_stream_ssl_init_connection(ngx_ssl_t *ssl, ngx_connection_t *c)
 
     cscf = ngx_stream_get_module_srv_conf(s, ngx_stream_core_module);
 
-    if (cscf->tcp_nodelay && ngx_tcp_nodelay(c) != NGX_OK) {
+    if (c->type == SOCK_STREAM
+        && cscf->tcp_nodelay && ngx_tcp_nodelay(c) != NGX_OK)
+    {
         return NGX_ERROR;
     }
 
