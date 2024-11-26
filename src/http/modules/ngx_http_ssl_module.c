@@ -108,6 +108,22 @@ static ngx_command_t  ngx_http_ssl_commands[] = {
       offsetof(ngx_http_ssl_srv_conf_t, certificate_keys),
       NULL },
 
+#ifdef OSSL_ECH_CURRENT_VERSION
+    { ngx_string("ssl_echconfig"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_array_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_ssl_srv_conf_t, echconfigs),
+      NULL },
+
+    { ngx_string("ssl_echconfig_key"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_array_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_ssl_srv_conf_t, echconfig_keys),
+      NULL },
+#endif
+
     { ngx_string("ssl_password_file"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_http_ssl_password_file,
@@ -619,6 +635,10 @@ ngx_http_ssl_create_srv_conf(ngx_conf_t *cf)
     sscf->verify_depth = NGX_CONF_UNSET_UINT;
     sscf->certificates = NGX_CONF_UNSET_PTR;
     sscf->certificate_keys = NGX_CONF_UNSET_PTR;
+#ifdef OSSL_ECH_CURRENT_VERSION
+    sscf->echconfigs = NGX_CONF_UNSET_PTR;
+    sscf->echconfig_keys = NGX_CONF_UNSET_PTR;
+#endif
     sscf->passwords = NGX_CONF_UNSET_PTR;
     sscf->conf_commands = NGX_CONF_UNSET_PTR;
     sscf->builtin_session_cache = NGX_CONF_UNSET;
@@ -666,6 +686,11 @@ ngx_http_ssl_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_ptr_value(conf->certificate_keys, prev->certificate_keys,
                          NULL);
 
+#ifdef OSSL_ECH_CURRENT_VERSION
+    ngx_conf_merge_ptr_value(conf->echconfigs, prev->echconfigs, NULL);
+    ngx_conf_merge_ptr_value(conf->echconfig_keys, prev->echconfig_keys, NULL);
+#endif
+
     ngx_conf_merge_ptr_value(conf->passwords, prev->passwords, NULL);
 
     ngx_conf_merge_str_value(conf->dhparam, prev->dhparam, "");
@@ -712,6 +737,21 @@ ngx_http_ssl_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     } else if (!conf->reject_handshake) {
         return NGX_CONF_OK;
     }
+
+#ifdef OSSL_ECH_CURRENT_VERSION
+    if (conf->echconfigs) {
+        if (conf->echconfig_keys == NULL
+            || conf->echconfig_keys->nelts < conf->echconfigs->nelts)
+        {
+            ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                          "no \"ssl_echconfig_key\" is defined "
+                          "for ECH configuration \"%V\"",
+                          ((ngx_str_t *) conf->echconfigs->elts)
+                          + conf->echconfigs->nelts - 1);
+            return NGX_CONF_ERROR;
+        }
+    }
+#endif
 
     if (ngx_ssl_create(&conf->ssl, conf->protocols, conf) != NGX_OK) {
         return NGX_CONF_ERROR;
@@ -782,6 +822,17 @@ ngx_http_ssl_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
             return NGX_CONF_ERROR;
         }
     }
+
+#ifdef OSSL_ECH_CURRENT_VERSION
+    if (conf->echconfigs) {
+        if (ngx_ssl_echconfigs(cf, &conf->ssl, conf->echconfigs,
+                               conf->echconfig_keys, conf->passwords)
+            != NGX_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+    }
+#endif
 
     conf->ssl.buffer_size = conf->buffer_size;
 

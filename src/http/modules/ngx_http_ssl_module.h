@@ -38,6 +38,11 @@ typedef struct {
     ngx_array_t                    *certificate_values;
     ngx_array_t                    *certificate_key_values;
 
+#ifdef OSSL_ECH_CURRENT_VERSION
+    ngx_array_t                    *echconfigs;
+    ngx_array_t                    *echconfig_keys;
+#endif
+
     ngx_str_t                       dhparam;
     ngx_str_t                       ecdh_curve;
     ngx_str_t                       client_certificate;

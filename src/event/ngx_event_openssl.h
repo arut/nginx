@@ -209,6 +209,15 @@ ngx_int_t ngx_ssl_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl,
 ngx_int_t ngx_ssl_connection_certificate(ngx_connection_t *c, ngx_pool_t *pool,
     ngx_str_t *cert, ngx_str_t *key, ngx_array_t *passwords);
 
+
+#ifdef OSSL_ECH_CURRENT_VERSION
+ngx_int_t ngx_ssl_echconfigs(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_array_t *confs,
+    ngx_array_t *keys, ngx_array_t *passwords);
+ngx_int_t ngx_ssl_echconfig(ngx_conf_t *cf, ngx_ssl_t *ssl, OSSL_ECHSTORE *es,
+    ngx_str_t *conf, ngx_str_t *key, ngx_array_t *passwords,
+    ngx_uint_t for_retry);
+#endif
+
 ngx_int_t ngx_ssl_ciphers(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *ciphers,
     ngx_uint_t prefer_server_ciphers);
 ngx_int_t ngx_ssl_client_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl,
