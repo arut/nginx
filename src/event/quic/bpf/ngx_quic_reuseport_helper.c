@@ -44,97 +44,93 @@ char _license[] SEC("license") = LICENSE;
 #define NGX_QUIC_SERVER_CID_LEN  20
 
 
-#define advance_data(nbytes)                                                  \
-    offset += nbytes;                                                         \
-    if (start + offset > end) {                                               \
-        debugmsg("cannot read %ld bytes at offset %ld", nbytes, offset);      \
-        goto failed;                                                          \
-    }                                                                         \
-    data = start + offset - 1;
-
-
-#define ngx_quic_parse_uint64(p)                                              \
-    (((__u64)(p)[0] << 56) |                                                  \
-     ((__u64)(p)[1] << 48) |                                                  \
-     ((__u64)(p)[2] << 40) |                                                  \
-     ((__u64)(p)[3] << 32) |                                                  \
-     ((__u64)(p)[4] << 24) |                                                  \
-     ((__u64)(p)[5] << 16) |                                                  \
-     ((__u64)(p)[6] << 8)  |                                                  \
-     ((__u64)(p)[7]))
-
-/*
- * actual map object is created by the "bpf" system call,
- * all pointers to this variable are replaced by the bpf loader
- */
-struct bpf_map_def SEC("maps") ngx_quic_sockmap;
+struct bpf_map_def SEC("maps")  ngx_quic_listen;
+struct bpf_map_def SEC("maps")  ngx_quic_worker;
+struct bpf_map_def SEC("maps")  ngx_quic_nlisten;
 
 
 SEC(PROGNAME)
-int ngx_quic_select_socket_by_dcid(struct sk_reuseport_md *ctx)
+int ngx_quic_select_socket_by_dcid(struct sk_reuseport_md *ctx)                                                       \
 {
-    int             rc;
-    __u64           key;
+    int             rc, flags;
+    __u32           zero, *nsockets, ns;
     size_t          len, offset;
-    unsigned char  *start, *end, *data, *dcid;
+    unsigned char  *start, *end, dcid[NGX_QUIC_SERVER_CID_LEN];
 
     start = ctx->data;
-    end = (unsigned char *) ctx->data_end;
-    offset = 0;
+    end = ctx->data_end;
 
-    advance_data(sizeof(struct udphdr)); /* data at UDP header */
-    advance_data(1); /* data at QUIC flags */
+    offset = sizeof(struct udphdr) + 1; /* UDP header + QUIC flags */
+    if (start + offset > end) {
+        goto bad_dgram;
+    }
 
-    if (data[0] & NGX_QUIC_PKT_LONG) {
+    flags = start[offset - 1];
+    if (flags & NGX_QUIC_PKT_LONG) {
 
-        advance_data(4); /* data at QUIC version */
-        advance_data(1); /* data at DCID len */
-
-        len = data[0];   /* read DCID length */
-
-        if (len < 8) {
-            /* it's useless to search for key in such short DCID */
-            return SK_PASS;
+        offset += 5; /* QUIC version + DCID len */
+        if (start + offset > end) {
+            goto bad_dgram;
         }
 
-    } else {
-        len = NGX_QUIC_SERVER_CID_LEN;
+        len = start[offset - 1];
+        if (len != NGX_QUIC_SERVER_CID_LEN) {
+            goto new_conn;
+        }
     }
 
-    dcid = &data[1];
-    advance_data(len); /* we expect the packet to have full DCID */
-
-    /* make verifier happy */
-    if (dcid + sizeof(__u64) > end) {
-        goto failed;
+    if (start + offset + NGX_QUIC_SERVER_CID_LEN > end) {
+        goto bad_dgram;
     }
 
-    key = ngx_quic_parse_uint64(dcid);
+    memcpy(dcid, start + offset, NGX_QUIC_SERVER_CID_LEN);
 
-    rc = bpf_sk_select_reuseport(ctx, &ngx_quic_sockmap, &key, 0);
+    rc = bpf_sk_select_reuseport(ctx, &ngx_quic_worker, dcid, 0);
 
-    switch (rc) {
-    case 0:
-        debugmsg("nginx quic socket selected by key 0x%llx", key);
+    if (rc == 0) {
+        debugmsg("nginx quic socket selected by dcid");
         return SK_PASS;
-
-    /* kernel returns positive error numbers, errno.h defines positive */
-    case -ENOENT:
-        debugmsg("nginx quic default route for key 0x%llx", key);
-        /* let the default reuseport logic decide which socket to choose */
-        return SK_PASS;
-
-    default:
-        debugmsg("nginx quic bpf_sk_select_reuseport err: %d key 0x%llx",
-                 rc, key);
-        goto failed;
     }
 
-failed:
-    /*
-     * SK_DROP will generate ICMP, but we may want to process "invalid" packet
-     * in userspace quic to investigate further and finally react properly
-     * (maybe ignore, maybe send something in response or close connection)
-     */
-    return SK_PASS;
+    if (rc != -ENOENT) {
+        debugmsg("nginx quic bpf_sk_select_reuseport() failed:%d", rc);
+        return SK_DROP;
+    }
+
+new_conn:
+
+    zero = 0;
+
+    nsockets = bpf_map_lookup_elem(&ngx_quic_nlisten, &zero);
+
+    if (nsockets == NULL) {
+        debugmsg("nginx quic nsockets undefined");
+        return SK_DROP;
+    }
+
+    ns = ctx->hash % *nsockets;
+
+    rc = bpf_sk_select_reuseport(ctx, &ngx_quic_listen, &ns, 0);
+
+    if (rc == 0) {
+        debugmsg("nginx quic socket selected by hash:%d", (int) ns);
+        return SK_PASS;
+    }
+
+    if (rc != -ENOENT) {
+        debugmsg("nginx quic bpf_sk_select_reuseport() failed:%d", rc);
+        return SK_DROP;
+    }
+
+    (void) bpf_map_update_elem(&ngx_quic_nlisten, &zero, &ns, BPF_ANY);
+
+    debugmsg("nginx quic cut sockets array:%d", (int) ns);
+
+    return SK_DROP;
+
+bad_dgram:
+
+    debugmsg("nginx quic bad datagram");
+
+    return SK_DROP;
 }

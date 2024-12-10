@@ -39,6 +39,9 @@ typedef struct ngx_quic_keys_s        ngx_quic_keys_t;
 #include <ngx_event_quic_ack.h>
 #include <ngx_event_quic_output.h>
 #include <ngx_event_quic_socket.h>
+#if (NGX_QUIC_BPF)
+#include <ngx_event_quic_bpf.h>
+#endif
 
 
 /* RFC 9002, 6.2.2.  Handshakes and New Paths: kInitialRtt */
@@ -47,6 +50,8 @@ typedef struct ngx_quic_keys_s        ngx_quic_keys_t;
 #define NGX_QUIC_UNSET_PN                    (uint64_t) -1
 
 #define NGX_QUIC_SEND_CTX_LAST               (NGX_QUIC_ENCRYPTION_LAST - 1)
+
+#define NGX_QUIC_MAX_SERVER_IDS              8
 
 /*  0-RTT and 1-RTT data exist in the same packet number space,
  *  so we have 3 packet number spaces:
@@ -286,6 +291,7 @@ struct ngx_quic_connection_s {
     unsigned                          key_phase:1;
     unsigned                          validated:1;
     unsigned                          client_tp_done:1;
+    unsigned                          listen_bound:1;
 };
 
 

@@ -6,6 +6,8 @@
 
 #include <ngx_config.h>
 #include <ngx_core.h>
+#include <ngx_event.h>
+#include <ngx_event_quic_connection.h>
 
 
 #define NGX_QUIC_BPF_VARNAME  "NGINX_BPF_MAPS"
@@ -26,39 +28,57 @@
 
 typedef struct {
     ngx_queue_t           queue;
-    int                   map_fd;
+
+    int                   listen_map;
+    int                   worker_map;
+    int                   nlisten_map;
 
     struct sockaddr      *sockaddr;
     socklen_t             socklen;
-    ngx_uint_t            unused;     /* unsigned  unused:1; */
-} ngx_quic_sock_group_t;
+
+    ngx_array_t           listening;
+
+    ngx_uint_t            nlisten;
+    ngx_uint_t            old_nlisten;
+} ngx_quic_bpf_group_t;
+
+
+typedef struct {
+    ngx_socket_t          fd;
+    ngx_listening_t      *listening;
+    ngx_connection_t     *connection;
+} ngx_quic_bpf_listening_t;
 
 
 typedef struct {
     ngx_flag_t            enabled;
-    ngx_uint_t            map_size;
-    ngx_queue_t           groups;     /* of ngx_quic_sock_group_t */
+    ngx_uint_t            max_connection_ids;
+    ngx_uint_t            max_workers;
+    ngx_queue_t           groups;
 } ngx_quic_bpf_conf_t;
 
 
 static void *ngx_quic_bpf_create_conf(ngx_cycle_t *cycle);
+static char *ngx_quic_bpf_init_conf(ngx_cycle_t *cycle, void *conf);
 static ngx_int_t ngx_quic_bpf_module_init(ngx_cycle_t *cycle);
 
 static void ngx_quic_bpf_cleanup(void *data);
 static ngx_inline void ngx_quic_bpf_close(ngx_log_t *log, int fd,
     const char *name);
 
-static ngx_quic_sock_group_t *ngx_quic_bpf_find_group(ngx_quic_bpf_conf_t *bcf,
+static ngx_quic_bpf_group_t *ngx_quic_bpf_find_group(ngx_cycle_t *cycle,
     ngx_listening_t *ls);
-static ngx_quic_sock_group_t *ngx_quic_bpf_alloc_group(ngx_cycle_t *cycle,
-    struct sockaddr *sa, socklen_t socklen);
-static ngx_quic_sock_group_t *ngx_quic_bpf_create_group(ngx_cycle_t *cycle,
+static ngx_quic_bpf_group_t *ngx_quic_bpf_alloc_group(ngx_cycle_t *cycle,
     ngx_listening_t *ls);
-static ngx_quic_sock_group_t *ngx_quic_bpf_get_group(ngx_cycle_t *cycle,
+static ngx_quic_bpf_group_t *ngx_quic_bpf_create_group(ngx_cycle_t *cycle,
+    ngx_listening_t *ls);
+static ngx_int_t ngx_quic_bpf_inherit_fd(ngx_cycle_t *cycle, int fd);
+static ngx_quic_bpf_group_t *ngx_quic_bpf_get_group(ngx_cycle_t *cycle,
     ngx_listening_t *ls);
 static ngx_int_t ngx_quic_bpf_group_add_socket(ngx_cycle_t *cycle,
     ngx_listening_t *ls);
-static uint64_t ngx_quic_bpf_socket_key(ngx_fd_t fd, ngx_log_t *log);
+static ngx_int_t ngx_quic_bpf_add_worker_socket(ngx_cycle_t *cycle,
+    ngx_quic_bpf_group_t *grp, ngx_listening_t *ls);
 
 static ngx_int_t ngx_quic_bpf_export_maps(ngx_cycle_t *cycle);
 static ngx_int_t ngx_quic_bpf_import_maps(ngx_cycle_t *cycle);
@@ -82,7 +102,7 @@ static ngx_command_t  ngx_quic_bpf_commands[] = {
 static ngx_core_module_t  ngx_quic_bpf_module_ctx = {
     ngx_string("quic_bpf"),
     ngx_quic_bpf_create_conf,
-    NULL
+    ngx_quic_bpf_init_conf
 };
 
 
@@ -113,11 +133,38 @@ ngx_quic_bpf_create_conf(ngx_cycle_t *cycle)
     }
 
     bcf->enabled = NGX_CONF_UNSET;
-    bcf->map_size = NGX_CONF_UNSET_UINT;
 
     ngx_queue_init(&bcf->groups);
 
     return bcf;
+}
+
+
+static char *
+ngx_quic_bpf_init_conf(ngx_cycle_t *cycle, void *conf)
+{
+    ngx_quic_bpf_conf_t *bcf = conf;
+
+    ngx_quic_bpf_conf_t  *obcf;
+
+    ngx_conf_init_value(bcf->enabled, 0);
+
+    if (cycle->old_cycle->conf_ctx == NULL) {
+        return NGX_CONF_OK;
+    }
+
+    obcf = ngx_quic_bpf_get_conf(cycle->old_cycle);
+    if (obcf == NULL) {
+        return NGX_CONF_OK;
+    }
+
+    if (obcf->enabled != bcf->enabled) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "cannot change \"quic_bpf\" after reload, ignoring");
+        bcf->enabled = obcf->enabled;
+    }
+
+    return NGX_CONF_OK;
 }
 
 
@@ -127,6 +174,7 @@ ngx_quic_bpf_module_init(ngx_cycle_t *cycle)
     ngx_uint_t            i;
     ngx_listening_t      *ls;
     ngx_core_conf_t      *ccf;
+    ngx_event_conf_t     *ecf;
     ngx_pool_cleanup_t   *cln;
     ngx_quic_bpf_conf_t  *bcf;
 
@@ -138,12 +186,16 @@ ngx_quic_bpf_module_init(ngx_cycle_t *cycle)
         return NGX_OK;
     }
 
-    ccf = ngx_core_get_conf(cycle);
     bcf = ngx_quic_bpf_get_conf(cycle);
+    if (!bcf->enabled) {
+        return NGX_OK;
+    }
 
-    ngx_conf_init_value(bcf->enabled, 0);
+    ccf = ngx_core_get_conf(cycle);
+    ecf = ngx_event_get_conf(cycle->conf_ctx, ngx_event_core_module);
 
-    bcf->map_size = ccf->worker_processes * 4;
+    bcf->max_connection_ids = ecf->connections * NGX_QUIC_MAX_SERVER_IDS;
+    bcf->max_workers = ccf->worker_processes * 4;
 
     cln = ngx_pool_cleanup_add(cycle->pool, 0);
     if (cln == NULL) {
@@ -152,6 +204,8 @@ ngx_quic_bpf_module_init(ngx_cycle_t *cycle)
 
     cln->data = bcf;
     cln->handler = ngx_quic_bpf_cleanup;
+
+    ls = cycle->listening.elts;
 
     if (ngx_inherited && ngx_is_init_cycle(cycle->old_cycle)) {
         if (ngx_quic_bpf_import_maps(cycle) != NGX_OK) {
@@ -208,16 +262,32 @@ ngx_quic_bpf_cleanup(void *data)
 {
     ngx_quic_bpf_conf_t  *bcf = (ngx_quic_bpf_conf_t *) data;
 
-    ngx_queue_t            *q;
-    ngx_quic_sock_group_t  *grp;
+    ngx_uint_t                 i;
+    ngx_queue_t               *q;
+    ngx_quic_bpf_group_t      *grp;
+    ngx_quic_bpf_listening_t  *bls;
 
     for (q = ngx_queue_head(&bcf->groups);
          q != ngx_queue_sentinel(&bcf->groups);
          q = ngx_queue_next(q))
     {
-        grp = ngx_queue_data(q, ngx_quic_sock_group_t, queue);
+        grp = ngx_queue_data(q, ngx_quic_bpf_group_t, queue);
 
-        ngx_quic_bpf_close(ngx_cycle->log, grp->map_fd, "map");
+        ngx_quic_bpf_close(ngx_cycle->log, grp->listen_map, "listen");
+        ngx_quic_bpf_close(ngx_cycle->log, grp->worker_map, "worker");
+        ngx_quic_bpf_close(ngx_cycle->log, grp->nlisten_map, "nlisten");
+
+        bls = grp->listening.elts;
+
+        for (i = 0; i < grp->listening.nelts; i++) {
+            if (bls[i].fd != (ngx_socket_t) -1) {
+                if (ngx_close_socket(bls[i].fd) == -1) {
+                    ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log,
+                                  ngx_socket_errno,
+                                  ngx_close_socket_n " failed");
+                }
+            }
+        }
     }
 }
 
@@ -230,25 +300,32 @@ ngx_quic_bpf_close(ngx_log_t *log, int fd, const char *name)
     }
 
     ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
-                  "quic bpf close %s fd:%d failed", name, fd);
+                  "QUIC BPF close %s map fd:%d failed", name, fd);
 }
 
 
-static ngx_quic_sock_group_t *
-ngx_quic_bpf_find_group(ngx_quic_bpf_conf_t *bcf, ngx_listening_t *ls)
+static ngx_quic_bpf_group_t *
+ngx_quic_bpf_find_group(ngx_cycle_t *cycle, ngx_listening_t *ls)
 {
-    ngx_queue_t            *q;
-    ngx_quic_sock_group_t  *grp;
+    ngx_queue_t           *q;
+    ngx_quic_bpf_conf_t   *bcf;
+    ngx_quic_bpf_group_t  *grp;
+
+    bcf = ngx_quic_bpf_get_conf(cycle);
+
+    if (!bcf->enabled || !ls->quic || !ls->reuseport) {
+        return NULL;
+    }
 
     for (q = ngx_queue_head(&bcf->groups);
          q != ngx_queue_sentinel(&bcf->groups);
          q = ngx_queue_next(q))
     {
-        grp = ngx_queue_data(q, ngx_quic_sock_group_t, queue);
+        grp = ngx_queue_data(q, ngx_quic_bpf_group_t, queue);
 
         if (ngx_cmp_sockaddr(ls->sockaddr, ls->socklen,
                              grp->sockaddr, grp->socklen, 1)
-            == NGX_OK)
+            == 0)
         {
             return grp;
         }
@@ -258,26 +335,32 @@ ngx_quic_bpf_find_group(ngx_quic_bpf_conf_t *bcf, ngx_listening_t *ls)
 }
 
 
-static ngx_quic_sock_group_t *
-ngx_quic_bpf_alloc_group(ngx_cycle_t *cycle, struct sockaddr *sa,
-    socklen_t socklen)
+static ngx_quic_bpf_group_t *
+ngx_quic_bpf_alloc_group(ngx_cycle_t *cycle, ngx_listening_t *ls)
 {
     ngx_quic_bpf_conf_t    *bcf;
-    ngx_quic_sock_group_t  *grp;
+    ngx_quic_bpf_group_t  *grp;
 
     bcf = ngx_quic_bpf_get_conf(cycle);
 
-    grp = ngx_pcalloc(cycle->pool, sizeof(ngx_quic_sock_group_t));
+    grp = ngx_pcalloc(cycle->pool, sizeof(ngx_quic_bpf_group_t));
     if (grp == NULL) {
         return NULL;
     }
 
-    grp->socklen = socklen;
-    grp->sockaddr = ngx_palloc(cycle->pool, socklen);
-    if (grp->sockaddr == NULL) {
+    grp->listen_map = -1;
+    grp->worker_map = -1;
+    grp->nlisten_map = -1;
+
+    grp->sockaddr = ls->sockaddr;
+    grp->socklen = ls->socklen;
+
+    if (ngx_array_init(&grp->listening, cycle->pool, 1,
+                       sizeof(ngx_quic_bpf_listening_t))
+        != NGX_OK)
+    {
         return NULL;
     }
-    ngx_memcpy(grp->sockaddr, sa, socklen);
 
     ngx_queue_insert_tail(&bcf->groups, &grp->queue);
 
@@ -285,50 +368,72 @@ ngx_quic_bpf_alloc_group(ngx_cycle_t *cycle, struct sockaddr *sa,
 }
 
 
-static ngx_quic_sock_group_t *
+static ngx_quic_bpf_group_t *
 ngx_quic_bpf_create_group(ngx_cycle_t *cycle, ngx_listening_t *ls)
 {
-    int                     progfd, failed, flags, rc;
-    ngx_quic_bpf_conf_t    *bcf;
-    ngx_quic_sock_group_t  *grp;
+    int                    progfd, failed;
+    ngx_quic_bpf_conf_t   *bcf;
+    ngx_quic_bpf_group_t  *grp;
 
     bcf = ngx_quic_bpf_get_conf(cycle);
 
-    if (!bcf->enabled) {
-        return NULL;
-    }
-
-    grp = ngx_quic_bpf_alloc_group(cycle, ls->sockaddr, ls->socklen);
+    grp = ngx_quic_bpf_alloc_group(cycle, ls);
     if (grp == NULL) {
         return NULL;
     }
 
-    grp->map_fd = ngx_bpf_map_create(cycle->log, BPF_MAP_TYPE_SOCKHASH,
-                                     sizeof(uint64_t), sizeof(uint64_t),
-                                     bcf->map_size, 0);
-    if (grp->map_fd == -1) {
+    grp->listen_map = ngx_bpf_map_create(cycle->log, BPF_MAP_TYPE_SOCKMAP,
+                                         sizeof(uint32_t), sizeof(uint64_t),
+                                         bcf->max_workers, 0);
+    if (grp->listen_map == -1) {
         goto failed;
     }
 
-    flags = fcntl(grp->map_fd, F_GETFD);
-    if (flags == -1) {
-        ngx_log_error(NGX_LOG_EMERG, cycle->log, errno,
-                      "quic bpf getfd failed");
-        goto failed;
-    }
-
-    /* need to inherit map during binary upgrade after exec */
-    flags &= ~FD_CLOEXEC;
-
-    rc = fcntl(grp->map_fd, F_SETFD, flags);
-    if (rc == -1) {
-        ngx_log_error(NGX_LOG_EMERG, cycle->log, errno,
-                      "quic bpf setfd failed");
+    if (ngx_quic_bpf_inherit_fd(cycle, grp->listen_map) != NGX_OK) {
         goto failed;
     }
 
     ngx_bpf_program_link(&ngx_quic_reuseport_helper,
-                         "ngx_quic_sockmap", grp->map_fd);
+                         "ngx_quic_listen", grp->listen_map);
+
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
+                   "quic bpf listen map created fd:%d", grp->listen_map);
+
+
+    grp->worker_map = ngx_bpf_map_create(cycle->log, BPF_MAP_TYPE_SOCKHASH,
+                                     NGX_QUIC_SERVER_CID_LEN, sizeof(uint64_t),
+                                     bcf->max_connection_ids, 0);
+    if (grp->worker_map == -1) {
+        goto failed;
+    }
+
+    if (ngx_quic_bpf_inherit_fd(cycle, grp->worker_map) != NGX_OK) {
+        goto failed;
+    }
+
+    ngx_bpf_program_link(&ngx_quic_reuseport_helper,
+                         "ngx_quic_worker", grp->worker_map);
+
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
+                   "quic bpf worker map created fd:%d", grp->worker_map);
+
+
+    grp->nlisten_map = ngx_bpf_map_create(cycle->log, BPF_MAP_TYPE_ARRAY,
+                                     sizeof(uint32_t), sizeof(uint32_t), 1, 0);
+    if (grp->nlisten_map == -1) {
+        goto failed;
+    }
+
+    if (ngx_quic_bpf_inherit_fd(cycle, grp->nlisten_map) != NGX_OK) {
+        goto failed;
+    }
+
+    ngx_bpf_program_link(&ngx_quic_reuseport_helper,
+                         "ngx_quic_nlisten", grp->nlisten_map);
+
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
+                   "quic bpf nlisten map created fd:%d", grp->nlisten_map);
+
 
     progfd = ngx_bpf_load_program(cycle->log, &ngx_quic_reuseport_helper);
     if (progfd < 0) {
@@ -352,14 +457,20 @@ ngx_quic_bpf_create_group(ngx_cycle_t *cycle, ngx_listening_t *ls)
         goto failed;
     }
 
-    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
-                   "quic bpf sockmap created fd:%d", grp->map_fd);
     return grp;
 
 failed:
 
-    if (grp->map_fd != -1) {
-        ngx_quic_bpf_close(cycle->log, grp->map_fd, "map");
+    if (grp->listen_map != -1) {
+        ngx_quic_bpf_close(cycle->log, grp->listen_map, "listen");
+    }
+
+    if (grp->worker_map != -1) {
+        ngx_quic_bpf_close(cycle->log, grp->worker_map, "worker");
+    }
+
+    if (grp->nlisten_map != -1) {
+        ngx_quic_bpf_close(cycle->log, grp->nlisten_map, "nlisten");
     }
 
     ngx_queue_remove(&grp->queue);
@@ -368,129 +479,269 @@ failed:
 }
 
 
-static ngx_quic_sock_group_t *
+static ngx_int_t
+ngx_quic_bpf_inherit_fd(ngx_cycle_t *cycle, int fd)
+{
+    int  flags;
+
+    flags = fcntl(fd, F_GETFD);
+    if (flags == -1) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "fcntl(F_GETFD) failed");
+        return NGX_ERROR;
+    }
+
+    flags &= ~FD_CLOEXEC;
+
+    if (fcntl(fd, F_SETFD, flags) == -1) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "fcntl(F_SETFD) failed");
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_quic_bpf_group_t *
 ngx_quic_bpf_get_group(ngx_cycle_t *cycle, ngx_listening_t *ls)
 {
-    ngx_quic_bpf_conf_t    *bcf, *old_bcf;
-    ngx_quic_sock_group_t  *grp, *ogrp;
+    ngx_quic_bpf_conf_t   *old_bcf;
+    ngx_quic_bpf_group_t  *grp, *ogrp;
 
-    bcf = ngx_quic_bpf_get_conf(cycle);
-
-    grp = ngx_quic_bpf_find_group(bcf, ls);
+    grp = ngx_quic_bpf_find_group(cycle, ls);
     if (grp) {
         return grp;
     }
 
     old_bcf = ngx_quic_bpf_get_old_conf(cycle);
-
     if (old_bcf == NULL) {
         return ngx_quic_bpf_create_group(cycle, ls);
     }
 
-    ogrp = ngx_quic_bpf_find_group(old_bcf, ls);
+    ogrp = ngx_quic_bpf_find_group(cycle->old_cycle, ls);
     if (ogrp == NULL) {
         return ngx_quic_bpf_create_group(cycle, ls);
     }
 
-    grp = ngx_quic_bpf_alloc_group(cycle, ls->sockaddr, ls->socklen);
+    grp = ngx_quic_bpf_alloc_group(cycle, ls);
     if (grp == NULL) {
         return NULL;
     }
 
-    grp->map_fd = dup(ogrp->map_fd);
-    if (grp->map_fd == -1) {
+    grp->old_nlisten = ogrp->nlisten;
+
+    grp->listen_map = dup(ogrp->listen_map);
+    if (grp->listen_map == -1) {
         ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
-                      "quic bpf failed to duplicate bpf map descriptor");
+                      "failed to duplicate QUIC BPF listen map");
 
-        ngx_queue_remove(&grp->queue);
-
-        return NULL;
+        goto failed;
     }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
-                   "quic bpf sockmap fd duplicated old:%d new:%d",
-                   ogrp->map_fd, grp->map_fd);
+    grp->worker_map = dup(ogrp->worker_map);
+    if (grp->worker_map == -1) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "failed to duplicate QUIC BPF worker map");
+        goto failed;
+    }
+
+    grp->nlisten_map = dup(ogrp->nlisten_map);
+    if (grp->nlisten_map == -1) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "failed to duplicate QUIC BPF nlisten map");
+        goto failed;
+    }
 
     return grp;
+
+failed:
+
+    if (grp->listen_map != -1) {
+        ngx_quic_bpf_close(cycle->log, grp->listen_map, "listen");
+    }
+
+    if (grp->worker_map != -1) {
+        ngx_quic_bpf_close(cycle->log, grp->worker_map, "worker");
+    }
+
+    if (grp->nlisten_map != -1) {
+        ngx_quic_bpf_close(cycle->log, grp->nlisten_map, "nlisten");
+    }
+
+    ngx_queue_remove(&grp->queue);
+
+    return NULL;
 }
 
 
 static ngx_int_t
 ngx_quic_bpf_group_add_socket(ngx_cycle_t *cycle,  ngx_listening_t *ls)
 {
-    uint64_t                cookie;
-    ngx_quic_bpf_conf_t    *bcf;
-    ngx_quic_sock_group_t  *grp;
-
-    bcf = ngx_quic_bpf_get_conf(cycle);
+    uint32_t               zero, key;
+    ngx_quic_bpf_group_t  *grp;
 
     grp = ngx_quic_bpf_get_group(cycle, ls);
-
     if (grp == NULL) {
-        if (!bcf->enabled) {
-            return NGX_OK;
-        }
-
         return NGX_ERROR;
     }
 
-    grp->unused = 0;
-
-    cookie = ngx_quic_bpf_socket_key(ls->fd, cycle->log);
-    if (cookie == (uint64_t) NGX_ERROR) {
+    if (ngx_quic_bpf_add_worker_socket(cycle, grp, ls) != NGX_OK) {
         return NGX_ERROR;
     }
 
-    /* map[cookie] = socket; for use in kernel helper */
-    if (ngx_bpf_map_update(grp->map_fd, &cookie, &ls->fd, BPF_ANY) == -1) {
+    key = ls->worker;
+
+    if (ngx_bpf_map_update(grp->listen_map, &key, &ls->fd, BPF_ANY) == -1) {
         ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
-                      "quic bpf failed to update socket map key=%xL", cookie);
+                      "failed to update QUIC BPF listen map");
         return NGX_ERROR;
     }
 
-    ngx_log_debug4(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
-                 "quic bpf sockmap fd:%d add socket:%d cookie:0x%xL worker:%ui",
-                 grp->map_fd, ls->fd, cookie, ls->worker);
+    if (grp->nlisten >= ls->worker + 1) {
+        return NGX_OK;
+    }
 
-    /* do not inherit this socket */
-    ls->ignore = 1;
+    grp->nlisten = ls->worker + 1;
+
+    if (grp->nlisten <= grp->old_nlisten) {
+        return NGX_OK;
+    }
+
+    zero = 0;
+    key = grp->nlisten;
+
+    if (ngx_bpf_map_update(grp->nlisten_map, &zero, &key, BPF_ANY) == -1) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "failed to update QUIC BPF nlisten map");
+        return NGX_ERROR;
+    }
 
     return NGX_OK;
 }
 
 
-static uint64_t
-ngx_quic_bpf_socket_key(ngx_fd_t fd, ngx_log_t *log)
+static ngx_int_t
+ngx_quic_bpf_add_worker_socket(ngx_cycle_t *cycle, ngx_quic_bpf_group_t *grp,
+    ngx_listening_t *ls)
 {
-    uint64_t   cookie;
-    socklen_t  optlen;
+    int                        value;
+    ngx_uint_t                 i, n;
+    ngx_socket_t               s;
+    ngx_quic_bpf_listening_t  *bls;
 
-    optlen = sizeof(cookie);
-
-    if (getsockopt(fd, SOL_SOCKET, SO_COOKIE, &cookie, &optlen) == -1) {
-        ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
-                      "quic bpf getsockopt(SO_COOKIE) failed");
-
-        return (ngx_uint_t) NGX_ERROR;
+    s = ngx_socket(ls->sockaddr->sa_family, SOCK_DGRAM, 0);
+    if (s == (ngx_socket_t) -1) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_socket_errno,
+                      ngx_socket_n " failed");
+        return NGX_ERROR;
     }
 
-    return cookie;
-}
+    if (ngx_nonblocking(s) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                      ngx_nonblocking_n " worker socket failed");
+        goto failed;
+    }
 
+    value = 1;
+
+    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+                (const void *) &value, sizeof(int))
+        == -1)
+    {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                      "setsockopt(SO_REUSEADDR) worker socket failed");
+        goto failed;
+    }
+
+    if (setsockopt(s, SOL_SOCKET, SO_REUSEPORT,
+                   (const void *) &value, sizeof(int))
+        == -1)
+    {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                      "setsockopt(SO_REUSEPORT) worker socket failed");
+        goto failed;
+    }
+
+#if (NGX_HAVE_IP_PKTINFO)
+    if (ls->wildcard && ls->sockaddr->sa_family == AF_INET) {
+        if (setsockopt(s, IPPROTO_IP, IP_PKTINFO,
+                       (const void *) &value, sizeof(int))
+            == -1)
+        {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                          "setsockopt(IP_PKTINFO) worker socket failed");
+            goto failed;
+        }
+    }
+#endif
+
+#if (NGX_HAVE_INET6 && NGX_HAVE_IPV6_RECVPKTINFO)
+    if (ls->wildcard && ls->sockaddr->sa_family == AF_INET6) {
+        if (setsockopt(s, IPPROTO_IPV6, IPV6_RECVPKTINFO,
+                       (const void *) &value, sizeof(int))
+            == -1)
+        {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                          "setsockopt(IPV6_RECVPKTINFO) worker socket failed");
+        }
+    }
+#endif
+
+    if (bind(s, ls->sockaddr, ls->socklen) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                      "bind() failed");
+        goto failed;
+    }
+
+    if (ls->worker >= grp->listening.nelts) {
+        n = ls->worker + 1 - grp->listening.nelts;
+
+        bls = ngx_array_push_n(&grp->listening, n);
+        if (bls == NULL) {
+            goto failed;
+        }
+
+        ngx_memzero(bls, n * sizeof(ngx_quic_bpf_listening_t));
+
+        for (i = 0; i < n; i++) {
+            bls[i].fd = (ngx_socket_t) -1;
+        }
+    }
+
+    bls = grp->listening.elts;
+    bls[ls->worker].fd = s;
+    bls[ls->worker].listening  = ls;
+
+    return NGX_OK;
+
+failed:
+
+    if (ngx_close_socket(s) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                      ngx_close_socket_n " failed");
+    }
+
+    return NGX_ERROR;
+}
 
 static ngx_int_t
 ngx_quic_bpf_export_maps(ngx_cycle_t *cycle)
 {
-    u_char                 *p, *buf;
-    size_t                  len;
-    ngx_str_t              *var;
-    ngx_queue_t            *q;
-    ngx_core_conf_t        *ccf;
-    ngx_quic_bpf_conf_t    *bcf;
-    ngx_quic_sock_group_t  *grp;
+    u_char                *p, *buf;
+    size_t                 len;
+    ngx_str_t             *var;
+    ngx_queue_t           *q;
+    ngx_core_conf_t       *ccf;
+    ngx_quic_bpf_conf_t   *bcf;
+    ngx_quic_bpf_group_t  *grp;
+
+    bcf = ngx_quic_bpf_get_conf(cycle);
+    if (!bcf->enabled) {
+        return NGX_OK;
+    }
 
     ccf = ngx_core_get_conf(cycle);
-    bcf = ngx_quic_bpf_get_conf(cycle);
 
     len = sizeof(NGX_QUIC_BPF_VARNAME) + 1;
 
@@ -498,24 +749,26 @@ ngx_quic_bpf_export_maps(ngx_cycle_t *cycle)
 
     while (q != ngx_queue_sentinel(&bcf->groups)) {
 
-        grp = ngx_queue_data(q, ngx_quic_sock_group_t, queue);
+        grp = ngx_queue_data(q, ngx_quic_bpf_group_t, queue);
 
         q = ngx_queue_next(q);
 
-        if (grp->unused) {
+        if (grp->nlisten == 0) {
             /*
              * map was inherited, but it is not used in this configuration;
              * do not pass such map further and drop the group to prevent
              * interference with changes during reload
              */
 
-            ngx_quic_bpf_close(cycle->log, grp->map_fd, "map");
-            ngx_queue_remove(&grp->queue);
+            ngx_quic_bpf_close(cycle->log, grp->listen_map, "listen");
+            ngx_quic_bpf_close(cycle->log, grp->worker_map, "worker");
+            ngx_quic_bpf_close(cycle->log, grp->nlisten_map, "nlisten");
 
+            ngx_queue_remove(&grp->queue);
             continue;
         }
 
-        len += NGX_INT32_LEN + 1 + NGX_SOCKADDR_STRLEN + 1;
+        len += (NGX_INT32_LEN + 1) * 3 + NGX_SOCKADDR_STRLEN + 1;
     }
 
     len++;
@@ -525,22 +778,23 @@ ngx_quic_bpf_export_maps(ngx_cycle_t *cycle)
         return NGX_ERROR;
     }
 
-    p = ngx_cpymem(buf, NGX_QUIC_BPF_VARNAME "=",
-                   sizeof(NGX_QUIC_BPF_VARNAME));
+    p = ngx_cpymem(buf, NGX_QUIC_BPF_VARNAME "=", sizeof(NGX_QUIC_BPF_VARNAME));
 
     for (q = ngx_queue_head(&bcf->groups);
          q != ngx_queue_sentinel(&bcf->groups);
          q = ngx_queue_next(q))
     {
-        grp = ngx_queue_data(q, ngx_quic_sock_group_t, queue);
+        grp = ngx_queue_data(q, ngx_quic_bpf_group_t, queue);
 
-        p = ngx_sprintf(p, "%ud", grp->map_fd);
-
+        p = ngx_sprintf(p, "%ud", grp->listen_map);
+        *p++ = NGX_QUIC_BPF_ADDRSEP;
+        p = ngx_sprintf(p, "%ud", grp->worker_map);
+        *p++ = NGX_QUIC_BPF_ADDRSEP;
+        p = ngx_sprintf(p, "%ud", grp->nlisten_map);
         *p++ = NGX_QUIC_BPF_ADDRSEP;
 
         p += ngx_sock_ntop(grp->sockaddr, grp->socklen, p,
                            NGX_SOCKADDR_STRLEN, 1);
-
         *p++ = NGX_QUIC_BPF_VARSEP;
     }
 
@@ -561,12 +815,14 @@ ngx_quic_bpf_export_maps(ngx_cycle_t *cycle)
 static ngx_int_t
 ngx_quic_bpf_import_maps(ngx_cycle_t *cycle)
 {
-    int                     s;
-    u_char                 *inherited, *p, *v;
-    ngx_uint_t              in_fd;
-    ngx_addr_t              tmp;
-    ngx_quic_bpf_conf_t    *bcf;
-    ngx_quic_sock_group_t  *grp;
+    int                    fds[3];
+    u_char                *inherited, *p, *v;
+    uint32_t               zero, nlisten;
+    ngx_int_t              fd;
+    ngx_uint_t             nfd;
+    ngx_addr_t             tmp;
+    ngx_quic_bpf_conf_t   *bcf;
+    ngx_quic_bpf_group_t  *grp;
 
     inherited = (u_char *) getenv(NGX_QUIC_BPF_VARNAME);
 
@@ -574,13 +830,13 @@ ngx_quic_bpf_import_maps(ngx_cycle_t *cycle)
         return NGX_OK;
     }
 
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                  "using inherited QUIC BPF maps from \"%s\"", inherited);
+
     bcf = ngx_quic_bpf_get_conf(cycle);
 
-#if (NGX_SUPPRESS_WARN)
-    s = -1;
-#endif
-
-    in_fd = 1;
+    zero = 0;
+    nfd = 0;
 
     for (p = inherited, v = p; *p; p++) {
 
@@ -588,69 +844,198 @@ ngx_quic_bpf_import_maps(ngx_cycle_t *cycle)
 
         case NGX_QUIC_BPF_ADDRSEP:
 
-            if (!in_fd) {
-                ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                              "quic bpf failed to parse inherited env");
-                return NGX_ERROR;
-            }
-            in_fd = 0;
-
-            s = ngx_atoi(v, p - v);
-            if (s == NGX_ERROR) {
-                ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                              "quic bpf failed to parse inherited map fd");
-                return NGX_ERROR;
+            if (nfd > 2) {
+                goto failed;
             }
 
+            fd = ngx_atoi(v, p - v);
+            if (fd == NGX_ERROR) {
+                goto failed;
+            }
+
+            fds[nfd++] = fd;
             v = p + 1;
             break;
 
         case NGX_QUIC_BPF_VARSEP:
 
-            if (in_fd) {
-                ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                              "quic bpf failed to parse inherited env");
-                return NGX_ERROR;
+            if (nfd != 3) {
+                goto failed;
             }
-            in_fd = 1;
 
-            grp = ngx_pcalloc(cycle->pool,
-                              sizeof(ngx_quic_sock_group_t));
+            grp = ngx_pcalloc(cycle->pool, sizeof(ngx_quic_bpf_group_t));
             if (grp == NULL) {
                 return NGX_ERROR;
             }
 
-            grp->map_fd = s;
-
-            if (ngx_parse_addr_port(cycle->pool, &tmp, v, p - v)
+            if (ngx_array_init(&grp->listening, cycle->pool, 1,
+                               sizeof(ngx_quic_bpf_listening_t))
                 != NGX_OK)
             {
-                ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                              "quic bpf failed to parse inherited"
-                              " address '%*s'", p - v , v);
-
-                ngx_quic_bpf_close(cycle->log, s, "inherited map");
-
                 return NGX_ERROR;
             }
 
-            grp->sockaddr = tmp.sockaddr;
+            grp->listen_map = fds[0];
+            grp->worker_map = fds[1];
+            grp->nlisten_map = fds[2];
+
+            if (ngx_parse_addr_port(cycle->pool, &tmp, v, p - v) != NGX_OK) {
+                goto failed;
+            }
+
+            grp->sockaddr = ngx_pcalloc(cycle->pool, tmp.socklen);
+            if (grp->sockaddr == NULL) {
+                return NGX_ERROR;
+            }
+
+            ngx_memcpy(grp->sockaddr, tmp.sockaddr, tmp.socklen);
             grp->socklen = tmp.socklen;
 
-            grp->unused = 1;
+            if (ngx_bpf_map_lookup(fds[2], &zero, &nlisten) == -1) {
+                ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                              "failed to lookup QUIC BPF listen number");
+                return NGX_ERROR;
+            }
+
+            grp->old_nlisten = nlisten;
 
             ngx_queue_insert_tail(&bcf->groups, &grp->queue);
 
-            ngx_log_debug3(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
+            ngx_log_debug5(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
                            "quic bpf sockmap inherited with "
-                           "fd:%d address:%*s",
-                           grp->map_fd, p - v, v);
+                           "fds:%d/%d/%d address:%*s",
+                           fds[0], fds[1], fds[2], p - v, v);
+
+            nfd = 0;
             v = p + 1;
             break;
 
         default:
             break;
         }
+    }
+
+    return NGX_OK;
+
+failed:
+
+    ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                  "failed to parse inherited QUIC BPF variable");
+
+    return NGX_ERROR;
+}
+
+
+ngx_int_t
+ngx_quic_bpf_get_client_connection(ngx_connection_t *lc, ngx_connection_t **pc)
+{
+    ngx_event_t               *rev;
+    ngx_connection_t          *c;
+    ngx_quic_bpf_group_t      *grp;
+    ngx_quic_bpf_listening_t  *bpf_listening, *bls;
+
+    grp = ngx_quic_bpf_find_group((ngx_cycle_t *) ngx_cycle, lc->listening);
+
+    if (grp == NULL || ngx_worker >= grp->listening.nelts) {
+        return NGX_OK;
+    }
+
+    bpf_listening = grp->listening.elts;
+    bls = &bpf_listening[ngx_worker];
+
+    if (bls->fd == (ngx_socket_t) -1) {
+        return NGX_OK;
+    }
+
+    if (bls->connection == NULL) {
+        c = ngx_get_connection(bls->fd, lc->log);
+        if (c == NULL) {
+            return NGX_ERROR;
+        }
+
+        c->type = SOCK_DGRAM;
+        c->log = lc->log;
+        c->listening = bls->listening;
+
+        rev = c->read;
+        rev->quic = 1;
+        rev->log = c->log;
+        rev->handler = ngx_quic_recvmsg;
+
+        if (ngx_add_event(rev, NGX_READ_EVENT, 0) == NGX_ERROR) {
+            ngx_free_connection(c);
+            return NGX_ERROR;
+        }
+
+        bls->connection = c;
+
+        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, lc->log, 0,
+                       "quic bpf worker socket connection fd:%d", bls->fd);
+
+    }
+
+    *pc = ngx_get_connection(bls->fd, lc->log);
+    if (*pc == NULL) {
+        return NGX_ERROR;
+    }
+
+    (*pc)->shared = 1;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, lc->log, 0,
+                   "quic bpf client connection fd:%d", bls->fd);
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_quic_bpf_insert(ngx_connection_t *c, ngx_quic_connection_t *qc,
+    ngx_quic_socket_t *qsock)
+{
+    ngx_quic_bpf_group_t  *grp;
+
+    if (qsock->sid.len != NGX_QUIC_SERVER_CID_LEN) {
+        /* route by address */
+        return NGX_OK;
+    }
+
+    grp = ngx_quic_bpf_find_group((ngx_cycle_t *) ngx_cycle, c->listening);
+    if (grp == NULL) {
+        return NGX_OK;
+    }
+
+    if (ngx_bpf_map_update(grp->worker_map, qsock->sid.id, &c->fd, BPF_ANY)
+        == -1)
+    {
+        ngx_log_error(NGX_LOG_ALERT, c->log, ngx_errno,
+                      "failed to update QUIC BPF worker map");
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_quic_bpf_delete(ngx_connection_t *c, ngx_quic_connection_t *qc,
+    ngx_quic_socket_t *qsock)
+{
+    ngx_quic_bpf_group_t  *grp;
+
+    if (qsock->sid.len != NGX_QUIC_SERVER_CID_LEN) {
+        /* route by address */
+        return NGX_OK;
+    }
+
+    grp = ngx_quic_bpf_find_group((ngx_cycle_t *) ngx_cycle, c->listening);
+    if (grp == NULL) {
+        return NGX_OK;
+    }
+
+    if (ngx_bpf_map_delete(grp->worker_map, qsock->sid.id) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, ngx_errno,
+                      "failed to update QUIC BPF worker map");
+        return NGX_ERROR;
     }
 
     return NGX_OK;
