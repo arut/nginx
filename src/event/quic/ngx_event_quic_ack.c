@@ -350,7 +350,10 @@ ngx_quic_congestion_ack(ngx_connection_t *c, ngx_quic_frame_t *f)
     }
 
     if (cg->window < cg->ssthresh) {
-        cg->window += f->plen;
+
+        if (!cg->idle) {
+            cg->window += f->plen;
+        }
 
         ngx_log_debug4(NGX_LOG_DEBUG_EVENT, c->log, 0,
                        "quic congestion ack ss t:%M cwnd:%uz st:%z, if:%uz",
@@ -362,7 +365,7 @@ ngx_quic_congestion_ack(ngx_connection_t *c, ngx_quic_frame_t *f)
 
         w_cubic = ngx_quic_congestion_cubic(c);
 
-        cg->w_est += (uint64_t) qc->path->mtu * f->plen / cg->window;
+        cg->w_est += (uint64_t) cg->mtu * f->plen / cg->window;
 
         if (w_cubic < cg->w_est) {
             cg->window = cg->w_est;
@@ -374,10 +377,10 @@ ngx_quic_congestion_ack(ngx_connection_t *c, ngx_quic_frame_t *f)
         } else if (w_cubic > cg->window) {
 
             if (w_cubic >= cg->window * 3 / 2) {
-                cg->window += qc->path->mtu / 2;
+                cg->window += cg->mtu / 2;
 
             } else {
-                cg->window += (uint64_t) qc->path->mtu * (w_cubic - cg->window)
+                cg->window += (uint64_t) cg->mtu * (w_cubic - cg->window)
                               / cg->window;
             }
 
@@ -434,7 +437,7 @@ ngx_quic_congestion_cubic(ngx_connection_t *c)
                               / (1000 * 1000 * 1000);
      */
 
-    num = qc->path->mtu;
+    num = cg->mtu;
     den = 2500000000l;
 
     for (i = 0; i < 3; i++) {
@@ -478,16 +481,12 @@ ngx_quic_congestion_idle(ngx_connection_t *c, ngx_uint_t idle)
     qc = ngx_quic_get_connection(c);
     cg = &qc->congestion;
 
-    if (cg->window < cg->ssthresh) {
-        return;
-    }
-
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
                    "quic congestion idle:%ui", idle);
 
     now = ngx_current_msec;
 
-    if (cg->idle) {
+    if (cg->window >= cg->ssthresh && cg->idle) {
         cg->target += now - cg->t;
     }
 
@@ -815,9 +814,11 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
         goto done;
     }
 
+    cg->mtu = qc->path->mtu;
     cg->w_max = cg->window;
     cg->recovery_start = now;
     cg->window /= 2;
+
 
     target = ngx_quic_congestion_cubic_time(c);
 
@@ -855,7 +856,7 @@ ngx_quic_congestion_cubic_time(ngx_connection_t *c)
     qc = ngx_quic_get_connection(c);
     cg = &qc->congestion;
 
-    target = pow((double) (cg->w_max - cg->window) / qc->path->mtu / .4,
+    target = pow((double) (cg->w_max - cg->window) / cg->mtu / .4,
                  1/3.) * 1000;
 
 #else
@@ -880,7 +881,7 @@ ngx_quic_congestion_cubic_time(ngx_connection_t *c)
      *   + 22/729 * (x - x0)^5 * x0^(1/3-5)
      */
 
-    x = ((int64_t) cg->w_max - (int64_t) cg->window) * 5 / 2 / qc->path->mtu;
+    x = ((int64_t) cg->w_max - (int64_t) cg->window) * 5 / 2 / cg->mtu;
 
     x0 = 1;
     y0 = 1;
@@ -905,7 +906,7 @@ ngx_quic_congestion_cubic_time(ngx_connection_t *c)
     {
         ngx_msec_t target1;
 
-        target1 = pow((double) (cg->w_max - cg->window) / qc->path->mtu / .4,
+        target1 = pow((double) (cg->w_max - cg->window) / cg->mtu / .4,
                       1/3.) * 1000;
 
         ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,

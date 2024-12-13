@@ -403,6 +403,11 @@ eintr:
 
         switch (err) {
         case NGX_EAGAIN:
+    for (i = 0, size = 0; i < (size_t) msg->msg_iovlen; i++) {
+        size += msg->msg_iov[i].iov_len;
+    }
+    n = size;
+    goto ignore_eagain;
             ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, err,
                            "sendmsg() not ready");
             return NGX_AGAIN;
@@ -418,6 +423,8 @@ eintr:
             return NGX_ERROR;
         }
     }
+
+ignore_eagain:
 
 #if (NGX_DEBUG)
     for (i = 0, size = 0; i < (size_t) msg->msg_iovlen; i++) {

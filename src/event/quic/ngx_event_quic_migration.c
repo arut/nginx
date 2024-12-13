@@ -615,6 +615,7 @@ void
 ngx_quic_discover_path_mtu(ngx_connection_t *c, ngx_quic_path_t *path)
 {
     ngx_quic_connection_t  *qc;
+    return;
 
     qc = ngx_quic_get_connection(c);
 

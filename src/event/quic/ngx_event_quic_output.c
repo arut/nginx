@@ -94,8 +94,6 @@ ngx_quic_output(ngx_connection_t *c)
         return NGX_ERROR;
     }
 
-    ngx_quic_congestion_idle(c, ngx_quic_queue_empty(c));
-
     if (in_flight == cg->in_flight || qc->closing) {
         /* no ack-eliciting data was sent or we are done */
         return NGX_OK;
@@ -123,6 +121,7 @@ ngx_quic_queue_empty(ngx_connection_t *c)
 
     for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
         ctx = &qc->send_ctx[i];
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0, "quic queue %s empty:%ui", ngx_quic_level_name(ctx->level), (ngx_uint_t) ngx_queue_empty(&ctx->frames));
 
         if (!ngx_queue_empty(&ctx->frames)) {
             return 0;
@@ -255,6 +254,8 @@ ngx_quic_commit_send(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx)
     ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
                    "quic congestion send t:%M cwnd:%uz if:%uz",
                    ngx_current_msec, cg->window, cg->in_flight);
+
+    ngx_quic_congestion_idle(c, ngx_quic_queue_empty(c));
 }
 
 
@@ -272,6 +273,8 @@ ngx_quic_revert_send(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
     }
 
     ctx->pnum = pnum;
+
+    ngx_quic_congestion_idle(c, 1);
 }
 
 
