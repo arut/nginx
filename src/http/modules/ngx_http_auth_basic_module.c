@@ -317,11 +317,13 @@ ngx_http_auth_basic_crypt_handler(ngx_http_request_t *r, ngx_str_t *passwd,
 static ngx_int_t
 ngx_http_auth_basic_set_realm(ngx_http_request_t *r, ngx_str_t *realm)
 {
-    size_t   len;
-    u_char  *basic, *p;
+    size_t                     len;
+    u_char                    *basic, *p;
+    ngx_table_elt_t           *h;
+    ngx_http_core_loc_conf_t  *clcf;
 
-    r->headers_out.www_authenticate = ngx_list_push(&r->headers_out.headers);
-    if (r->headers_out.www_authenticate == NULL) {
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -329,8 +331,7 @@ ngx_http_auth_basic_set_realm(ngx_http_request_t *r, ngx_str_t *realm)
 
     basic = ngx_pnalloc(r->pool, len);
     if (basic == NULL) {
-        r->headers_out.www_authenticate->hash = 0;
-        r->headers_out.www_authenticate = NULL;
+        h->hash = 0;
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -338,13 +339,23 @@ ngx_http_auth_basic_set_realm(ngx_http_request_t *r, ngx_str_t *realm)
     p = ngx_cpymem(p, realm->data, realm->len);
     *p = '"';
 
-    r->headers_out.www_authenticate->hash = 1;
-    r->headers_out.www_authenticate->next = NULL;
-    ngx_str_set(&r->headers_out.www_authenticate->key, "WWW-Authenticate");
-    r->headers_out.www_authenticate->value.data = basic;
-    r->headers_out.www_authenticate->value.len = len;
+    h->hash = 1;
+    h->next = NULL;
+    h->value.data = basic;
+    h->value.len = len;
 
-    return NGX_HTTP_UNAUTHORIZED;
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    if (clcf->auth_proxy) {
+        r->headers_out.proxy_authenticate = h;
+        ngx_str_set(&h->key, "Proxy-Authenticate");
+        return NGX_HTTP_PROXY_AUTH_REQUIRED;
+
+    } else {
+        r->headers_out.www_authenticate = h;
+        ngx_str_set(&h->key, "WWW-Authenticate");
+        return NGX_HTTP_UNAUTHORIZED;
+    }
 }
 
 

@@ -670,6 +670,14 @@ static ngx_command_t  ngx_http_core_commands[] = {
       offsetof(ngx_http_core_loc_conf_t, etag),
       NULL },
 
+    { ngx_string("auth_proxy"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF
+                        |NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_core_loc_conf_t, auth_proxy),
+      NULL },
+
     { ngx_string("error_page"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF
                         |NGX_CONF_2MORE,
@@ -1130,7 +1138,10 @@ ngx_http_core_access_phase(ngx_http_request_t *r, ngx_http_phase_handler_t *ph)
         if (rc == NGX_OK) {
             r->access_code = 0;
 
-            for (h = r->headers_out.www_authenticate; h; h = h->next) {
+            h = clcf->auth_proxy ? r->headers_out.proxy_authenticate
+                                 : r->headers_out.www_authenticate;
+
+            for ( /* void */ ; h; h = h->next) {
                 h->hash = 0;
             }
 
@@ -1956,19 +1967,26 @@ ngx_http_map_uri_to_path(ngx_http_request_t *r, ngx_str_t *path,
 ngx_int_t
 ngx_http_auth_basic_user(ngx_http_request_t *r)
 {
-    ngx_str_t   auth, encoded;
-    ngx_uint_t  len;
+    ngx_str_t                  auth, encoded;
+    ngx_uint_t                 len;
+    ngx_table_elt_t           *h;
+    ngx_http_core_loc_conf_t  *clcf;
 
     if (r->headers_in.user.len == 0 && r->headers_in.user.data != NULL) {
         return NGX_DECLINED;
     }
 
-    if (r->headers_in.authorization == NULL) {
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    h = clcf->auth_proxy ? r->headers_in.proxy_authorization
+                         : r->headers_in.authorization;
+
+    if (h == NULL) {
         r->headers_in.user.data = (u_char *) "";
         return NGX_DECLINED;
     }
 
-    encoded = r->headers_in.authorization->value;
+    encoded = h->value;
 
     if (encoded.len < sizeof("Basic ") - 1
         || ngx_strncasecmp(encoded.data, (u_char *) "Basic ",
@@ -2089,8 +2107,12 @@ ngx_http_gzip_ok(ngx_http_request_t *r)
         goto ok;
     }
 
-    if (r->headers_in.authorization && (p & NGX_HTTP_GZIP_PROXIED_AUTH)) {
-        goto ok;
+    if (p & NGX_HTTP_GZIP_PROXIED_AUTH) {
+        if ((clcf->auth_proxy && r->headers_in.proxy_authorization)
+            || (!clcf->auth_proxy && r->headers_in.authorization))
+        {
+            goto ok;
+        }
     }
 
     e = r->headers_out.expires;
@@ -3636,6 +3658,7 @@ ngx_http_core_create_loc_conf(ngx_conf_t *cf)
     clcf->recursive_error_pages = NGX_CONF_UNSET;
     clcf->chunked_transfer_encoding = NGX_CONF_UNSET;
     clcf->etag = NGX_CONF_UNSET;
+    clcf->auth_proxy = NGX_CONF_UNSET_UINT;
     clcf->server_tokens = NGX_CONF_UNSET_UINT;
     clcf->types_hash_max_size = NGX_CONF_UNSET_UINT;
     clcf->types_hash_bucket_size = NGX_CONF_UNSET_UINT;
@@ -3913,6 +3936,7 @@ ngx_http_core_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->chunked_transfer_encoding,
                               prev->chunked_transfer_encoding, 1);
     ngx_conf_merge_value(conf->etag, prev->etag, 1);
+    ngx_conf_merge_value(conf->auth_proxy, prev->auth_proxy, 0);
 
     ngx_conf_merge_uint_value(conf->server_tokens, prev->server_tokens,
                               NGX_HTTP_SERVER_TOKENS_ON);
