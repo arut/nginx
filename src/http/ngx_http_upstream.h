@@ -236,6 +236,7 @@ typedef struct {
     unsigned                         intercept_404:1;
     unsigned                         change_buffering:1;
     unsigned                         preserve_output:1;
+    unsigned                         shutdown_write:1;
 
 #if (NGX_HTTP_SSL || NGX_COMPAT)
     ngx_ssl_t                       *ssl;
@@ -249,6 +250,10 @@ typedef struct {
     ngx_http_complex_value_t        *ssl_certificate_key;
     ngx_ssl_cache_t                 *ssl_certificate_cache;
     ngx_array_t                     *ssl_passwords;
+#endif
+
+#if (NGX_QUIC || NGX_COMPAT)
+    ngx_quic_conf_t                  quic;
 #endif
 
     ngx_str_t                        module;
@@ -370,6 +375,7 @@ struct ngx_http_upstream_s {
     ngx_int_t                      (*create_key)(ngx_http_request_t *r);
 #endif
     ngx_int_t                      (*create_request)(ngx_http_request_t *r);
+    ngx_int_t                      (*create_stream)(ngx_http_request_t *r);
     ngx_int_t                      (*reinit_request)(ngx_http_request_t *r);
     ngx_int_t                      (*process_header)(ngx_http_request_t *r);
     void                           (*abort_request)(ngx_http_request_t *r);
@@ -390,6 +396,7 @@ struct ngx_http_upstream_s {
 
 #if (NGX_HTTP_SSL || NGX_COMPAT)
     ngx_str_t                        ssl_name;
+    ngx_str_t                        ssl_alpn_protocol;
 #endif
 
     ngx_http_cleanup_pt             *cleanup;
@@ -398,6 +405,7 @@ struct ngx_http_upstream_s {
     unsigned                         cacheable:1;
     unsigned                         accel:1;
     unsigned                         ssl:1;
+    unsigned                         quic:1;
 #if (NGX_HTTP_CACHE)
     unsigned                         cache_status:3;
 #endif

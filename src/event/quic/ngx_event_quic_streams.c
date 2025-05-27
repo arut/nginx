@@ -57,6 +57,50 @@ ngx_quic_is_stream_local(ngx_connection_t *c, uint64_t id)
 }
 
 
+ngx_int_t
+ngx_quic_has_streams(ngx_connection_t *c, ngx_uint_t local, ngx_uint_t bidi)
+{
+    uint64_t                type;
+    ngx_rbtree_t           *tree;
+    ngx_rbtree_node_t      *node;
+    ngx_quic_stream_t      *qs;
+    ngx_quic_connection_t  *qc;
+
+    qc = ngx_quic_get_connection(c);
+
+    /* TODO optimize */
+
+    type = 0;
+
+    if ((qc->is_server && local) || (!qc->is_server && !local)) {
+        type |= NGX_QUIC_STREAM_SERVER_INITIATED;
+    }
+
+    if (!bidi) {
+        type |= NGX_QUIC_STREAM_UNIDIRECTIONAL;
+    }
+
+    tree = &qc->streams.tree;
+
+    if (tree->root == tree->sentinel) {
+        return NGX_DECLINED;
+    }
+
+    node = ngx_rbtree_min(tree->root, tree->sentinel);
+
+    while (node) {
+        qs = (ngx_quic_stream_t *) node;
+        node = ngx_rbtree_next(tree, node);
+
+        if ((qs->id & 0x03) == type) {
+            return NGX_OK;
+        }
+    }
+
+    return NGX_DECLINED;
+}
+
+
 ngx_connection_t *
 ngx_quic_open_stream(ngx_connection_t *c, ngx_uint_t bidi)
 {
