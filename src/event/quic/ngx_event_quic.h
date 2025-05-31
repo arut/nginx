@@ -139,6 +139,9 @@ ngx_connection_t *ngx_quic_accept_stream(ngx_connection_t *c);
 ngx_int_t ngx_quic_has_streams(ngx_connection_t *c, ngx_uint_t local,
     ngx_uint_t bidi);
 ngx_connection_t *ngx_quic_open_stream(ngx_connection_t *c, ngx_uint_t bidi);
+ngx_int_t ngx_quic_has_streams(ngx_connection_t *c, ngx_uint_t local,
+    ngx_uint_t bidi);
+ngx_int_t ngx_quic_can_open_stream(ngx_connection_t *c, ngx_uint_t bidi);
 void ngx_quic_set_app_error(ngx_connection_t *c, ngx_uint_t err,
     const char *reason);
 ngx_uint_t ngx_quic_get_error(ngx_connection_t *c);

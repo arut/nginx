@@ -8,6 +8,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <ngx_http_v3_upstream_module.h>
 
 
 typedef struct {
@@ -19,9 +20,6 @@ typedef struct {
 
 
 static ngx_int_t ngx_http_v3_proxy_create_request(ngx_http_request_t *r);
-static ngx_int_t ngx_http_v3_proxy_create_stream(ngx_http_request_t *r);
-static void ngx_http_v3_proxy_quic_handler(ngx_connection_t *c);
-static ngx_int_t ngx_http_v3_proxy_handle_quic_connection(ngx_connection_t *c);
 static ngx_int_t ngx_http_v3_proxy_reinit_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_v3_proxy_body_output_filter(void *data,
      ngx_chain_t *in);
@@ -147,7 +145,7 @@ ngx_http_v3_proxy_handler(ngx_http_request_t *r)
 #endif
 
     u->create_request = ngx_http_v3_proxy_create_request;
-    u->create_stream = ngx_http_v3_proxy_create_stream;
+    u->create_stream = ngx_http_v3_upstream_create_stream;
     u->reinit_request = ngx_http_v3_proxy_reinit_request;
     u->process_header = ngx_http_v3_proxy_process_response;
     u->abort_request = ngx_http_v3_proxy_abort_request;
@@ -656,108 +654,6 @@ ngx_http_v3_proxy_create_request(ngx_http_request_t *r)
 
     b->flush = 1;
     cl->next = NULL;
-
-    return NGX_OK;
-}
-
-
-static ngx_int_t
-ngx_http_v3_proxy_create_stream(ngx_http_request_t *r)
-{
-    ngx_connection_t     *c, *sc;
-    ngx_http_upstream_t  *u;
-
-    u = r->upstream;
-    c = u->peer.connection;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "http3 proxy create stream");
-
-    c->ssl->handler = ngx_http_v3_proxy_quic_handler;
-
-    if (ngx_http_v3_init_session(c) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    if (ngx_http_v3_send_settings(c) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    sc = ngx_quic_open_stream(c, 1);
-    if (sc == NULL) {
-        return NGX_ERROR;
-    }
-
-    sc->data = r;
-
-    sc->requests++;
-    c->requests++;
-
-    if (c->read->timer_set) {
-        ngx_del_timer(c->read);
-    }
-
-    u->peer.connection = sc;
-    u->writer.connection = sc;
-
-    if (ngx_http_v3_proxy_handle_quic_connection(c) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    return NGX_OK;
-}
-
-
-static void
-ngx_http_v3_proxy_quic_handler(ngx_connection_t *c)
-{
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "http3 proxy handler");
-
-    if (c->close) {
-        ngx_http_v3_close_connection(c);
-        return;
-    }
-
-    if (ngx_http_v3_proxy_handle_quic_connection(c) != NGX_OK) {
-        ngx_http_v3_close_connection(c);
-    }
-}
-
-
-static ngx_int_t
-ngx_http_v3_proxy_handle_quic_connection(ngx_connection_t *c)
-{
-    ngx_connection_t  *sc;
-
-    if (c->read->timedout) {
-        ngx_quic_set_app_error(c, NGX_HTTP_V3_ERR_NO_ERROR,
-                               "keepalive shutdown");
-        return NGX_DONE;
-    }
-
-    while (!ngx_quic_get_error(c)) {
-
-        sc = ngx_quic_accept_stream(c);
-        if (sc == NULL) {
-            break;
-        }
-
-        if (!(sc->quic->stream->id & NGX_QUIC_STREAM_UNIDIRECTIONAL)) {
-            ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                          "upstream opened a quic bidi stream");
-            return NGX_ERROR;
-        }
-
-        ngx_http_v3_init_uni_stream(sc);
-    }
-
-    if (ngx_quic_has_streams(c, 1, 1) == NGX_DECLINED) {
-        ngx_quic_set_app_error(c, NGX_HTTP_V3_ERR_NO_ERROR, "shutdown");
-        return NGX_DONE;
-    }
-
-    if (ngx_quic_get_error(c)) {
-        return NGX_ERROR;
-    }
 
     return NGX_OK;
 }

@@ -139,6 +139,7 @@ struct ngx_http_v3_session_s {
     off_t                         total_bytes;
     off_t                         payload_bytes;
 
+    unsigned                      cached:1;
     unsigned                      goaway:1;
     unsigned                      hq:1;
 

@@ -101,6 +101,33 @@ ngx_quic_has_streams(ngx_connection_t *c, ngx_uint_t local, ngx_uint_t bidi)
 }
 
 
+ngx_int_t
+ngx_quic_can_open_stream(ngx_connection_t *c, ngx_uint_t bidi)
+{
+    ngx_quic_connection_t  *qc;
+
+    qc = ngx_quic_get_connection(c);
+
+    if (bidi) {
+        if (qc->streams.local_streams_bidi
+            >= qc->streams.local_max_streams_bidi)
+        {
+            return NGX_DECLINED;
+        }
+
+
+    } else {
+        if (qc->streams.local_streams_uni
+            >= qc->streams.local_max_streams_uni)
+        {
+            return NGX_DECLINED;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
 ngx_connection_t *
 ngx_quic_open_stream(ngx_connection_t *c, ngx_uint_t bidi)
 {
