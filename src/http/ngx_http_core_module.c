@@ -16,6 +16,8 @@ typedef struct {
 } ngx_http_method_name_t;
 
 
+#define NGX_HTTP_ERROR_LOG_CTX_OFF        -2
+
 #define NGX_HTTP_REQUEST_BODY_FILE_OFF    0
 #define NGX_HTTP_REQUEST_BODY_FILE_ON     1
 #define NGX_HTTP_REQUEST_BODY_FILE_CLEAN  2
@@ -67,6 +69,8 @@ static char *ngx_http_core_error_page(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_core_open_file_cache(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_core_error_log(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_core_error_log_ctx(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_core_keepalive(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -696,6 +700,13 @@ static ngx_command_t  ngx_http_core_commands[] = {
     { ngx_string("error_log"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
       ngx_http_core_error_log,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("error_log_ctx"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_core_error_log_ctx,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -3702,6 +3713,8 @@ ngx_http_core_create_loc_conf(ngx_conf_t *cf)
     clcf->disable_symlinks_from = NGX_CONF_UNSET_PTR;
 #endif
 
+    clcf->error_log_ctx_index = NGX_CONF_UNSET;
+
     return clcf;
 }
 
@@ -3832,6 +3845,10 @@ ngx_http_core_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->error_pages == NULL && prev->error_pages) {
         conf->error_pages = prev->error_pages;
     }
+
+    ngx_conf_merge_value(conf->error_log_ctx_index,
+                              prev->error_log_ctx_index,
+                              NGX_HTTP_ERROR_LOG_CTX_OFF);
 
     ngx_conf_merge_str_value(conf->default_type,
                               prev->default_type, "text/plain");
@@ -5087,6 +5104,43 @@ ngx_http_core_error_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_http_core_loc_conf_t *clcf = conf;
 
     return ngx_log_set_log(cf, &clcf->error_log);
+}
+
+
+static char *
+ngx_http_core_error_log_ctx(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_core_loc_conf_t *clcf = conf;
+
+    ngx_str_t  *value, name;
+
+    if (clcf->error_log_ctx_index != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+    name = value[1];
+
+    if (ngx_strcmp(name.data, "off") == 0) {
+        clcf->error_log_ctx_index = NGX_HTTP_ERROR_LOG_CTX_OFF;
+        return NGX_CONF_OK;
+    }
+
+    if (name.data[0] != '$') {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid variable name \"%V\"", &name);
+        return NGX_CONF_ERROR;
+    }
+
+    name.len--;
+    name.data++;
+
+    clcf->error_log_ctx_index = ngx_http_get_variable_index(cf, &name);
+    if (clcf->error_log_ctx_index == NGX_ERROR) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
 }
 
 

@@ -3944,10 +3944,13 @@ static u_char *
 ngx_http_log_error_handler(ngx_http_request_t *r, ngx_http_request_t *sr,
     u_char *buf, size_t len)
 {
-    char                      *uri_separator;
-    u_char                    *p;
-    ngx_http_upstream_t       *u;
-    ngx_http_core_srv_conf_t  *cscf;
+    char                       *uri_separator;
+    u_char                     *p;
+    ngx_http_upstream_t        *u;
+    ngx_http_core_srv_conf_t   *cscf;
+    ngx_http_core_loc_conf_t   *clcf;
+    ngx_http_variable_value_t  *v;
+
 
     cscf = ngx_http_get_module_srv_conf(r, ngx_http_core_module);
 
@@ -4008,6 +4011,17 @@ ngx_http_log_error_handler(ngx_http_request_t *r, ngx_http_request_t *sr,
         p = ngx_snprintf(buf, len, ", referrer: \"%V\"",
                          &r->headers_in.referer->value);
         buf = p;
+    }
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    if (clcf->error_log_ctx_index >= 0) {
+        v = ngx_http_get_flushed_variable(r, clcf->error_log_ctx_index);
+
+        if (v) {
+            p = ngx_snprintf(buf, len, ", ctx: \"%v\"", v);
+            buf = p;
+        }
     }
 
     return buf;
