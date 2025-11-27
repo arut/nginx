@@ -91,6 +91,7 @@ HTTP_SCGI=YES
 HTTP_GRPC=YES
 HTTP_PERL=NO
 HTTP_MEMCACHED=YES
+HTTP_DOH=YES
 HTTP_LIMIT_CONN=YES
 HTTP_LIMIT_REQ=YES
 HTTP_EMPTY_GIF=YES
@@ -280,6 +281,7 @@ $0: warning: the \"--with-ipv6\" option is deprecated"
         --without-http_scgi_module)      HTTP_SCGI=NO               ;;
         --without-http_grpc_module)      HTTP_GRPC=NO               ;;
         --without-http_memcached_module) HTTP_MEMCACHED=NO          ;;
+        --without-http_doh_module)       HTTP_DOH=NO                ;;
         --without-http_limit_conn_module) HTTP_LIMIT_CONN=NO        ;;
         --without-http_limit_req_module) HTTP_LIMIT_REQ=NO         ;;
         --without-http_empty_gif_module) HTTP_EMPTY_GIF=NO          ;;
@@ -500,6 +502,7 @@ cat << END
   --without-http_scgi_module         disable ngx_http_scgi_module
   --without-http_grpc_module         disable ngx_http_grpc_module
   --without-http_memcached_module    disable ngx_http_memcached_module
+  --without-http_doh_module          disable ngx_http_doh_module
   --without-http_limit_conn_module   disable ngx_http_limit_conn_module
   --without-http_limit_req_module    disable ngx_http_limit_req_module
   --without-http_empty_gif_module    disable ngx_http_empty_gif_module
