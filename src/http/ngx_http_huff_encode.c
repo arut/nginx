@@ -156,44 +156,21 @@ static ngx_http_huff_encode_code_t  ngx_http_huff_encode_table_lc[256] =
 };
 
 
-#if (!NGX_HAVE_LITTLE_ENDIAN)
-#define ngx_http_huff_encode_buf(dst, buf)                                    \
-    memcpy(dst, &buf, sizeof(ngx_uint_t))
-
-#elif (NGX_PTR_SIZE == 4 && NGX_HAVE_NONALIGNED)
-#define ngx_http_huff_encode_buf(dst, buf)                                    \
-    (*(uint32_t *) (dst) = htonl(buf))
-
-#elif (NGX_PTR_SIZE == 8 && NGX_HAVE_NONALIGNED && NGX_HAVE_GCC_BSWAP64)
-#define ngx_http_huff_encode_buf(dst, buf)                                    \
-    (*(uint64_t *) (dst) = __builtin_bswap64(buf))
-
-#else
-
 static ngx_inline void
 ngx_http_huff_encode_buf(u_char *dst, ngx_uint_t buf)
 {
-#if (NGX_PTR_SIZE == 4)
+#if (!NGX_HAVE_LITTLE_ENDIAN)
+    memcpy(dst, &buf, sizeof(ngx_uint_t));
 
-    if ((uintptr_t) dst % NGX_ALIGNMENT == 0) {
-        *(uint32_t *) dst = htonl(buf);
-        return;
-    }
+#elif (NGX_PTR_SIZE == 4)
+    buf = htonl(buf);
+    memcpy(dst, &buf, 4);
 
-    dst[0] = (u_char) (buf >> 24);
-    dst[1] = (u_char) (buf >> 16);
-    dst[2] = (u_char) (buf >> 8);
-    dst[3] = (u_char) buf;
+#elif (NGX_HAVE_GCC_BSWAP64)
+    buf = __builtin_bswap64(buf);
+    memcpy(dst, &buf, 8);
 
-#else /* NGX_PTR_SIZE == 8 */
-
-#if (NGX_HAVE_GCC_BSWAP64)
-    if ((uintptr_t) dst % NGX_ALIGNMENT == 0) {
-        *(uint64_t *) dst = __builtin_bswap64(buf);
-        return;
-    }
-#endif
-
+#else
     dst[0] = (u_char) (buf >> 56);
     dst[1] = (u_char) (buf >> 48);
     dst[2] = (u_char) (buf >> 40);
@@ -202,11 +179,8 @@ ngx_http_huff_encode_buf(u_char *dst, ngx_uint_t buf)
     dst[5] = (u_char) (buf >> 16);
     dst[6] = (u_char) (buf >> 8);
     dst[7] = (u_char) buf;
-
 #endif
 }
-
-#endif
 
 
 size_t
