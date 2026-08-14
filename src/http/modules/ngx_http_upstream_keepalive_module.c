@@ -37,6 +37,19 @@ typedef struct {
 
     ngx_http_upstream_conf_t          *tag;
 
+    /* number of streams currently multiplexed on the connection */
+    ngx_uint_t                         active;
+
+    /*
+     * a multiplexed connection: the protocol module manages its presence here
+     * through peer.notify() while it is in use, and get/free take the
+     * multiplexing path for it instead of the single-use keepalive path
+     */
+    unsigned                           multiplex:1;
+
+    /* the multiplexed connection currently has a free stream slot */
+    unsigned                           available:1;
+
 } ngx_http_upstream_keepalive_cache_t;
 
 
@@ -69,6 +82,8 @@ static void ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc,
 
 static void ngx_http_upstream_keepalive_dummy_handler(ngx_event_t *ev);
 static void ngx_http_upstream_keepalive_close_handler(ngx_event_t *ev);
+static void ngx_http_upstream_keepalive_set_idle(ngx_connection_t *c,
+    ngx_http_upstream_keepalive_cache_t *item, ngx_msec_t timeout);
 static void ngx_http_upstream_keepalive_close(ngx_connection_t *c);
 
 #if (NGX_HTTP_SSL)
@@ -192,10 +207,12 @@ ngx_http_upstream_init_keepalive_peer(ngx_http_request_t *r,
     r->upstream->peer.save_session = ngx_http_upstream_keepalive_save_session;
 #endif
 
-    if (r->upstream->peer.notify) {
-        kp->original_notify = r->upstream->peer.notify;
-        r->upstream->peer.notify = ngx_http_upstream_notify_keepalive_peer;
-    }
+    /*
+     * always install our notify handler (even if the balancer has none): a
+     * multiplexing protocol module signals stream-capacity changes through it
+     */
+    kp->original_notify = r->upstream->peer.notify;
+    r->upstream->peer.notify = ngx_http_upstream_notify_keepalive_peer;
 
     return NGX_OK;
 }
@@ -241,8 +258,62 @@ ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc, void *data)
                          item->socklen, pc->socklen)
             == 0)
         {
-            ngx_queue_remove(q);
-            ngx_queue_insert_head(&kp->conf->free, q);
+            if (item->multiplex) {
+
+                /* multiplexed connection: new, shared path */
+
+                if (c->close) {
+
+                    /*
+                     * going away (e.g. the peer sent GOAWAY) but still cached
+                     * while its remaining streams finish -- do not hand it out;
+                     * its last stream closes it (see free below)
+                     */
+
+                    continue;
+                }
+
+                if (!item->available) {
+
+                    /* out of stream slots right now */
+
+                    continue;
+                }
+
+                /*
+                 * Only a buffered request may share it: an unbuffered request
+                 * would head-of-line block the other streams, so skip such a
+                 * connection and look for (or open) a dedicated one.
+                 */
+
+                if (!kp->upstream->conf->buffering) {
+                    continue;
+                }
+
+                item->active++;
+
+                /*
+                 * Leave it in the cache so that other requests can share it
+                 * too.  If it is already serving streams (not idle), hand it
+                 * out as is; if idle, fall through to reactivate it.
+                 */
+
+                if (!c->idle) {
+                    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                                   "get keepalive peer: "
+                                   "multiplexing connection %p", c);
+                    pc->connection = c;
+                    pc->cached = 1;
+                    return NGX_DONE;
+                }
+
+            } else {
+
+                /* single-use connection: original keepalive path */
+
+                ngx_queue_remove(q);
+                ngx_queue_insert_head(&kp->conf->free, q);
+            }
 
             goto found;
         }
@@ -281,7 +352,7 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
     ngx_http_upstream_keepalive_peer_data_t  *kp = data;
     ngx_http_upstream_keepalive_cache_t      *item;
 
-    ngx_queue_t          *q;
+    ngx_queue_t          *q, *cache;
     ngx_connection_t     *c;
     ngx_http_upstream_t  *u;
 
@@ -292,6 +363,85 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
 
     u = kp->upstream;
     c = pc->connection;
+
+    /*
+     * A multiplexed connection is put in the cache once (below) and stays
+     * there while it serves streams.  Find it there: while other streams are
+     * still using it, this stream must only detach, never close it -- even on
+     * failure -- since the connection is shared.  Only once the last stream is
+     * gone is it returned to idle watching (if healthy) or dropped and closed.
+     */
+
+    if (c != NULL) {
+        cache = &kp->conf->cache;
+
+        for (q = ngx_queue_head(cache);
+             q != ngx_queue_sentinel(cache);
+             q = ngx_queue_next(q))
+        {
+            item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t,
+                                  queue);
+
+            if (item->connection != c) {
+                continue;
+            }
+
+            if (item->active > 0) {
+                item->active--;
+            }
+
+            if (item->active > 0) {
+
+                /* other streams remain: keep the shared connection for them */
+
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                               "free keepalive peer: multiplexed "
+                               "connection %p, %ui streams left",
+                               c, item->active);
+
+                pc->connection = NULL;
+                kp->original_free_peer(pc, kp->data, state);
+                return;
+            }
+
+            /* the last stream finished */
+
+            if (!(state & NGX_PEER_FAILED)
+                && !c->close
+                && !c->read->eof
+                && !c->read->error
+                && !c->write->error
+                && !c->read->timedout
+                && !c->write->timedout)
+            {
+                /* healthy: watch the connection again, keep it cached */
+
+                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                               "free keepalive peer: "
+                               "multiplexed connection %p now idle", c);
+
+                item->available = 1;
+
+                ngx_http_upstream_keepalive_set_idle(c, item,
+                                                     kp->conf->timeout);
+                pc->connection = NULL;
+
+            } else {
+
+                /* failed: drop from the cache, let the caller close it */
+
+                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                               "free keepalive peer: "
+                               "multiplexed connection %p failed", c);
+
+                ngx_queue_remove(&item->queue);
+                ngx_queue_insert_head(&kp->conf->free, &item->queue);
+            }
+
+            kp->original_free_peer(pc, kp->data, state);
+            return;
+        }
+    }
 
     if (state & NGX_PEER_FAILED
         || c == NULL
@@ -333,10 +483,33 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
 
     if (ngx_queue_empty(&kp->conf->free)) {
 
-        q = ngx_queue_last(&kp->conf->cache);
-        ngx_queue_remove(q);
+        /*
+         * All cache items are in use.  Evict the least recently used cached
+         * connection to make room -- but skip a multiplexed connection that is
+         * still serving streams (active > 0): closing it would free the shared
+         * connection while its streams are still attached.
+         */
 
-        item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
+        for (q = ngx_queue_last(&kp->conf->cache);
+             q != ngx_queue_sentinel(&kp->conf->cache);
+             q = ngx_queue_prev(q))
+        {
+            item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t,
+                                  queue);
+
+            if (item->active == 0) {
+                break;
+            }
+        }
+
+        if (q == ngx_queue_sentinel(&kp->conf->cache)) {
+
+            /* every cached connection is a busy multiplexed one */
+
+            goto invalid;
+        }
+
+        ngx_queue_remove(q);
 
         ngx_http_upstream_keepalive_close(item->connection);
 
@@ -351,32 +524,16 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
 
     item->connection = c;
     item->tag = u->conf;
-
-    pc->connection = NULL;
-
-    c->read->delayed = 0;
-    ngx_add_timer(c->read, kp->conf->timeout);
-
-    if (c->write->timer_set) {
-        ngx_del_timer(c->write);
-    }
-
-    c->write->handler = ngx_http_upstream_keepalive_dummy_handler;
-    c->read->handler = ngx_http_upstream_keepalive_close_handler;
-
-    c->data = item;
-    c->idle = 1;
-    c->log = ngx_cycle->log;
-    c->read->log = ngx_cycle->log;
-    c->write->log = ngx_cycle->log;
-    c->pool->log = ngx_cycle->log;
+    item->active = 0;
+    item->multiplex = 0;
+    item->available = 0;
 
     item->socklen = pc->socklen;
     ngx_memcpy(&item->sockaddr, pc->sockaddr, pc->socklen);
 
-    if (c->read->ready) {
-        ngx_http_upstream_keepalive_close_handler(c->read);
-    }
+    pc->connection = NULL;
+
+    ngx_http_upstream_keepalive_set_idle(c, item, kp->conf->timeout);
 
 invalid:
 
@@ -432,6 +589,39 @@ close:
 
     ngx_queue_remove(&item->queue);
     ngx_queue_insert_head(&conf->free, &item->queue);
+}
+
+
+/*
+ * Put a cached connection into the idle state: watch it for a close by the
+ * peer and arm the keepalive timeout.  Used both when a connection is first
+ * cached and when the last stream of a multiplexed connection finishes.
+ */
+
+static void
+ngx_http_upstream_keepalive_set_idle(ngx_connection_t *c,
+    ngx_http_upstream_keepalive_cache_t *item, ngx_msec_t timeout)
+{
+    c->read->delayed = 0;
+    ngx_add_timer(c->read, timeout);
+
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
+
+    c->write->handler = ngx_http_upstream_keepalive_dummy_handler;
+    c->read->handler = ngx_http_upstream_keepalive_close_handler;
+
+    c->data = item;
+    c->idle = 1;
+    c->log = ngx_cycle->log;
+    c->read->log = ngx_cycle->log;
+    c->write->log = ngx_cycle->log;
+    c->pool->log = ngx_cycle->log;
+
+    if (c->read->ready) {
+        ngx_http_upstream_keepalive_close_handler(c->read);
+    }
 }
 
 
@@ -491,7 +681,77 @@ ngx_http_upstream_notify_keepalive_peer(ngx_peer_connection_t *pc, void *data,
 {
     ngx_http_upstream_keepalive_peer_data_t  *kp = data;
 
-    kp->original_notify(pc, kp->data, type);
+    ngx_queue_t                          *q, *cache;
+    ngx_connection_t                     *c;
+    ngx_http_upstream_keepalive_cache_t  *item;
+
+    if (type != NGX_HTTP_UPSTREAM_NOTIFY_MPX_SPARE
+        && type != NGX_HTTP_UPSTREAM_NOTIFY_MPX_FULL)
+    {
+        if (kp->original_notify) {
+            kp->original_notify(pc, kp->data, type);
+        }
+
+        return;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                   "notify keepalive peer: %s",
+                   type == NGX_HTTP_UPSTREAM_NOTIFY_MPX_SPARE ? "multiplex"
+                                                              : "full");
+
+    /*
+     * A multiplexing protocol module reports a stream-capacity change for
+     * pc->connection (the real connection; the module points pc->connection at
+     * it around this call).  Keep it in the cache while it is in use so other
+     * requests can multiplex onto it, and track whether it currently has a
+     * free stream slot.
+     */
+
+    c = pc->connection;
+    cache = &kp->conf->cache;
+
+    for (q = ngx_queue_head(cache);
+         q != ngx_queue_sentinel(cache);
+         q = ngx_queue_next(q))
+    {
+        item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
+
+        if (item->connection == c) {
+            item->available = (type == NGX_HTTP_UPSTREAM_NOTIFY_MPX_SPARE);
+            return;
+        }
+    }
+
+    if (type == NGX_HTTP_UPSTREAM_NOTIFY_MPX_FULL) {
+        return;
+    }
+
+    /*
+     * First time this connection has spare capacity: cache it now, in use, so
+     * concurrent requests can share it (rather than waiting for it to finish).
+     * If there is no free slot, leave it -- it will be cached the usual way
+     * when its request finishes; we do not evict an in-use connection.
+     */
+
+    if (ngx_queue_empty(&kp->conf->free)) {
+        return;
+    }
+
+    q = ngx_queue_head(&kp->conf->free);
+    ngx_queue_remove(q);
+    ngx_queue_insert_head(cache, q);
+
+    item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
+
+    item->connection = c;
+    item->tag = kp->upstream->conf;
+    item->active = 1;               /* the request that established it */
+    item->multiplex = 1;
+    item->available = 1;
+
+    item->socklen = pc->socklen;
+    ngx_memcpy(&item->sockaddr, pc->sockaddr, pc->socklen);
 }
 
 

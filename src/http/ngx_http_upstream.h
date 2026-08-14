@@ -58,6 +58,13 @@
 
 
 #define NGX_HTTP_UPSTREAM_NOTIFY_HEADER      0x1
+/*
+ * a multiplexing protocol module (e.g. HTTP/2 proxy) uses these to hand the
+ * peer's connection to, or reclaim it from, the keepalive cache while it is
+ * still in use, so that concurrent requests can share it:
+ */
+#define NGX_HTTP_UPSTREAM_NOTIFY_MPX_SPARE   0x4  /* has a free stream slot */
+#define NGX_HTTP_UPSTREAM_NOTIFY_MPX_FULL    0x5  /* no free stream slot    */
 
 
 typedef struct {

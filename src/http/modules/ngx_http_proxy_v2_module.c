@@ -53,6 +53,19 @@ typedef struct {
     ngx_uint_t                     max_streams;
 
     /*
+     * whether this connection may carry concurrent streams; only buffered
+     * proxying is multiplexed, since an unbuffered stream would head-of-line
+     * block the others
+     */
+    ngx_uint_t                     multiplex;
+
+    /*
+     * last stream-capacity state reported to the keepalive module via
+     * peer.notify(); used to notify only on a change (spare <-> full)
+     */
+    ngx_uint_t                     available;
+
+    /*
      * connection-level demultiplexer: raw bytes are read from the real socket
      * into "buffer", and whole frames are handed to the stream they belong to.
      * frame_stream/frame_rest track the frame currently being handed out (0
@@ -68,6 +81,14 @@ typedef struct {
      * whose recv/send forward here
      */
     ngx_connection_t              *connection;
+
+    /*
+     * connection-scoped log: the real connection outlives any single request,
+     * so it cannot keep a per-request log (which would dangle); this one lives
+     * in the connection's pool and carries the connection number so that a
+     * shared (or idle) connection stays identifiable in the log
+     */
+    ngx_log_t                      log;
 } ngx_http_proxy_v2_conn_t;
 
 
@@ -87,6 +108,9 @@ struct ngx_http_proxy_v2_ctx_s {
 
     /* this stream's fake connection, assigned to u->peer.connection */
     ngx_connection_t              *fc;
+
+    /* the peer's free handler wrapped by init_stream() (see free_peer) */
+    ngx_event_free_peer_pt         original_free;
 
     /* node in connection->streams, keyed by stream id */
     ngx_rbtree_node_t              node;
@@ -224,10 +248,18 @@ static void ngx_http_proxy_v2_activate(ngx_http_proxy_v2_conn_t *h2c,
     ngx_uint_t id);
 static void ngx_http_proxy_v2_demux_read(ngx_event_t *rev);
 static void ngx_http_proxy_v2_demux_write(ngx_event_t *wev);
-static void ngx_http_proxy_v2_stream_register(ngx_http_proxy_v2_ctx_t *ctx);
-static void ngx_http_proxy_v2_stream_unregister(ngx_http_proxy_v2_ctx_t *ctx);
+static void ngx_http_proxy_v2_update_capacity(ngx_http_request_t *r,
+    ngx_http_proxy_v2_conn_t *h2c);
+static void ngx_http_proxy_v2_stream_register(ngx_http_request_t *r,
+    ngx_http_proxy_v2_ctx_t *ctx);
+static void ngx_http_proxy_v2_stream_unregister(ngx_http_request_t *r,
+    ngx_http_proxy_v2_ctx_t *ctx);
 static ngx_http_proxy_v2_ctx_t *ngx_http_proxy_v2_stream_lookup(
     ngx_http_proxy_v2_conn_t *h2c, ngx_uint_t id);
+static void ngx_http_proxy_v2_detach(ngx_http_request_t *r,
+    ngx_http_proxy_v2_ctx_t *ctx);
+static void ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
+    ngx_uint_t state);
 
 static void ngx_http_proxy_v2_abort_request(ngx_http_request_t *r);
 static void ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r,
@@ -1101,6 +1133,17 @@ ngx_http_proxy_v2_reinit_request(ngx_http_request_t *r)
 
     if (ctx == NULL) {
         return NGX_OK;
+    }
+
+    /*
+     * A previous attempt (e.g. before switching to a cached response or another
+     * upstream) may have attached this stream to a multiplexed connection;
+     * release it so that connection is not left referencing a stream that is
+     * about to be reinitialized.
+     */
+
+    if (ctx->connection != NULL) {
+        ngx_http_proxy_v2_detach(r, ctx);
     }
 
     ctx->state = 0;
@@ -2074,6 +2117,22 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
 
         if (rc == NGX_ERROR) {
             return NGX_ERROR;
+        }
+
+        /*
+         * The peer is going away: no new streams may be opened on this
+         * connection and it must not be returned to the keepalive cache for
+         * reuse.  Mark it now, before the retry decision below, so that even a
+         * stream that is retried elsewhere leaves the connection marked; the
+         * keepalive module honors c->close in both get and free, and it does
+         * not disturb the streams still in progress.  Otherwise the connection
+         * would be re-cached and immediately handed back to the retry, which,
+         * with the buffered GOAWAY replayed synchronously, recurses into
+         * ngx_http_upstream_next() until the stack is exhausted.
+         */
+
+        if (ctx->connection->connection != NULL) {
+            ctx->connection->connection->close = 1;
         }
 
         /*
@@ -3935,6 +3994,8 @@ ngx_http_proxy_v2_parse_settings(ngx_http_request_t *r,
                 ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "http proxy http2 max concurrent streams:%ui",
                                ctx->setting_value);
+
+                ngx_http_proxy_v2_update_capacity(r, ctx->connection);
             }
 
             if (ctx->setting_id == 0x04) {
@@ -4333,7 +4394,7 @@ ngx_http_proxy_v2_get_connection_data(ngx_http_request_t *r,
         ctx->connection->last_stream_id += 2;
         ctx->id = ctx->connection->last_stream_id;
 
-        ngx_http_proxy_v2_stream_register(ctx);
+        ngx_http_proxy_v2_stream_register(r, ctx);
 
         return NGX_OK;
     }
@@ -4365,18 +4426,79 @@ done:
     ctx->connection->active = NULL;
     ctx->connection->processing = 0;
     ctx->connection->max_streams = 0;
+    ctx->connection->multiplex = 0;
+    ctx->connection->available = 0;
+    ctx->connection->connection = NULL;
     ctx->connection->buffer = NULL;
     ctx->connection->frame_stream = 0;
     ctx->connection->frame_rest = 0;
 
-    ngx_http_proxy_v2_stream_register(ctx);
+    ngx_http_proxy_v2_stream_register(r, ctx);
 
     return NGX_OK;
 }
 
 
+/*
+ * Publish the spare concurrent-stream capacity to the real connection so the
+ * keepalive module can tell whether the connection may take another stream.
+ * Capacity is the peer's advertised maximum minus the streams in progress;
+ * it stays zero until the peer's SETTINGS_MAX_CONCURRENT_STREAMS is received.
+ */
+
 static void
-ngx_http_proxy_v2_stream_register(ngx_http_proxy_v2_ctx_t *ctx)
+ngx_http_proxy_v2_update_capacity(ngx_http_request_t *r,
+    ngx_http_proxy_v2_conn_t *h2c)
+{
+    ngx_uint_t              available;
+    ngx_connection_t       *c, *save;
+    ngx_peer_connection_t  *pc;
+
+    c = h2c->connection;
+
+    if (c == NULL) {
+        return;
+    }
+
+    available = h2c->multiplex && h2c->max_streams > h2c->processing;
+
+    if (available == h2c->available) {
+        return;
+    }
+
+    h2c->available = available;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "http proxy http2 capacity available:%ui processing:%ui",
+                   available, h2c->processing);
+
+    pc = &r->upstream->peer;
+
+    if (pc->notify == NULL) {
+        return;
+    }
+
+    /*
+     * Tell the keepalive module whether this connection can take another
+     * multiplexed stream.  peer.notify() works on pc->connection, but during a
+     * stream that is the fake per-stream connection, so point it at the real
+     * one for the call.
+     */
+
+    save = pc->connection;
+    pc->connection = c;
+
+    pc->notify(pc, pc->data,
+               available ? NGX_HTTP_UPSTREAM_NOTIFY_MPX_SPARE
+                         : NGX_HTTP_UPSTREAM_NOTIFY_MPX_FULL);
+
+    pc->connection = save;
+}
+
+
+static void
+ngx_http_proxy_v2_stream_register(ngx_http_request_t *r,
+    ngx_http_proxy_v2_ctx_t *ctx)
 {
     ctx->node.key = ctx->id;
 
@@ -4384,12 +4506,17 @@ ngx_http_proxy_v2_stream_register(ngx_http_proxy_v2_ctx_t *ctx)
 
     ctx->connection->processing++;
     ctx->registered = 1;
+
+    ngx_http_proxy_v2_update_capacity(r, ctx->connection);
 }
 
 
 static void
-ngx_http_proxy_v2_stream_unregister(ngx_http_proxy_v2_ctx_t *ctx)
+ngx_http_proxy_v2_stream_unregister(ngx_http_request_t *r,
+    ngx_http_proxy_v2_ctx_t *ctx)
 {
+    ngx_rbtree_node_t  *node;
+
     if (!ctx->registered) {
         return;
     }
@@ -4400,8 +4527,39 @@ ngx_http_proxy_v2_stream_unregister(ngx_http_proxy_v2_ctx_t *ctx)
     ctx->registered = 0;
 
     if (ctx->connection->active == ctx) {
-        ctx->connection->active = NULL;
+
+        /* hand activity to another stream so the demux keeps draining */
+
+        if (ctx->connection->streams.root != ctx->connection->streams.sentinel)
+        {
+            node = ngx_rbtree_min(ctx->connection->streams.root,
+                                  ctx->connection->streams.sentinel);
+            ctx->connection->active = (ngx_http_proxy_v2_ctx_t *)
+                          ((u_char *) node
+                           - offsetof(ngx_http_proxy_v2_ctx_t, node));
+        } else {
+            ctx->connection->active = NULL;
+        }
     }
+
+    /*
+     * Data left in the demux buffer once the last stream is gone is a frame the
+     * peer sent outside any stream while none was active to consume it -- a
+     * GOAWAY sent right after the final response, for instance, which the demux
+     * cannot deliver with no active stream.  Such a connection is not safely
+     * reusable, so mark it to be closed rather than returned to the cache; a
+     * GOAWAY seen while a stream is active does the same in its handler above.
+     */
+
+    if (ctx->connection->processing == 0
+        && ctx->connection->connection != NULL
+        && ctx->connection->buffer != NULL
+        && ctx->connection->buffer->pos < ctx->connection->buffer->last)
+    {
+        ctx->connection->connection->close = 1;
+    }
+
+    ngx_http_proxy_v2_update_capacity(r, ctx->connection);
 }
 
 
@@ -4454,11 +4612,12 @@ ngx_http_proxy_v2_stream_lookup(ngx_http_proxy_v2_conn_t *h2c, ngx_uint_t id)
 static ngx_int_t
 ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
 {
-    ngx_event_t               *rev, *wev;
-    ngx_connection_t          *c, *fc;
-    ngx_http_upstream_t       *u;
-    ngx_http_proxy_v2_ctx_t   *ctx;
-    ngx_http_proxy_v2_conn_t  *h2c;
+    ngx_event_t                *rev, *wev;
+    ngx_connection_t           *c, *fc;
+    ngx_http_upstream_t        *u;
+    ngx_http_proxy_v2_ctx_t    *ctx;
+    ngx_http_proxy_v2_conn_t   *h2c;
+    ngx_http_proxy_loc_conf_t  *plcf;
 
     u = r->upstream;
     c = u->peer.connection;
@@ -4518,16 +4677,60 @@ ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
     h2c->connection = c;
     h2c->active = ctx;
 
+    plcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_module);
+    h2c->multiplex = plcf->upstream.buffering;
+
+    ngx_http_proxy_v2_update_capacity(r, h2c);
+
     /*
-     * c->data stays pointing at the request (the upstream and the client-side
-     * SSL session callback rely on it); the demux handlers recover h2c through
-     * c->data -> ctx -> connection.
+     * c->data keeps referring to a request served by this connection (the
+     * upstream and the client-side SSL session callback rely on it).  It is
+     * pointed at the stream currently driving the connection (see send) and
+     * handed off when that request detaches (see detach), so it never dangles.
+     * The demux handlers themselves recover h2c through the connection pool
+     * cleanup handler, not c->data.
      */
 
     c->read->handler = ngx_http_proxy_v2_demux_read;
     c->write->handler = ngx_http_proxy_v2_demux_write;
 
+    /*
+     * The real connection is now shared by all streams, so it must not keep the
+     * per-request log that ngx_http_upstream_connect() just set on it (this
+     * request's client connection log): that log is freed when the client
+     * connection is closed, while other streams keep using the connection and
+     * its send handler (which dereferences c->log).  Give it a private
+     * connection-scoped log in its own pool instead; it inherits the file and
+     * level but carries the connection number so the shared (and later idle)
+     * connection stays identifiable in the log.  Per-stream logging still goes
+     * through the fake connection, which kept the request's log above.
+     */
+
+    h2c->log = *c->log;
+    h2c->log.handler = NULL;
+    h2c->log.data = NULL;
+    h2c->log.action = NULL;
+    h2c->log.connection = c->number;
+
+    c->log = &h2c->log;
+    c->read->log = &h2c->log;
+    c->write->log = &h2c->log;
+    c->pool->log = &h2c->log;
+
     u->peer.connection = fc;
+
+    /*
+     * Wrap the peer's free handler.  ngx_http_upstream_next() calls peer.free()
+     * directly, without going through u->finalize_request(), so on a stream
+     * failure the fake connection would still be assigned to u->peer.connection
+     * when the keepalive module and the following connection teardown run --
+     * and closing it would tear down the connection shared with other streams.
+     * The wrapper reverses the fake connection first.  On the normal path
+     * u->finalize_request() runs earlier and restores the original handler.
+     */
+
+    ctx->original_free = u->peer.free;
+    u->peer.free = ngx_http_proxy_v2_free_peer;
 
     return NGX_OK;
 }
@@ -4648,6 +4851,9 @@ ngx_http_proxy_v2_send(ngx_connection_t *fc, u_char *buf, size_t size)
     ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
     c = ctx->connection->connection;
 
+    /* claim the real connection for this stream while we drive it */
+    c->data = r;
+
     n = c->send(c, buf, size);
 
     if (n == NGX_ERROR) {
@@ -4683,6 +4889,9 @@ ngx_http_proxy_v2_send_chain(ngx_connection_t *fc, ngx_chain_t *in, off_t limit)
     ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
     c = ctx->connection->connection;
 
+    /* claim the real connection for this stream while we drive it */
+    c->data = r;
+
     sent = c->sent;
 
     cl = c->send_chain(c, in, limit);
@@ -4717,8 +4926,24 @@ ngx_http_proxy_v2_send_chain(ngx_connection_t *fc, ngx_chain_t *in, off_t limit)
 static ngx_http_proxy_v2_conn_t *
 ngx_http_proxy_v2_conn(ngx_connection_t *c)
 {
+    ngx_pool_cleanup_t       *cln;
     ngx_http_request_t       *r;
     ngx_http_proxy_v2_ctx_t  *ctx;
+
+    /*
+     * The connection state is stored on the connection pool via a cleanup
+     * handler, so it can be found without a request: c->data may point at a
+     * request that has already been freed while other streams keep the
+     * connection alive.
+     */
+
+    for (cln = c->pool->cleanup; cln; cln = cln->next) {
+        if (cln->handler == ngx_http_proxy_v2_cleanup) {
+            return cln->data;
+        }
+    }
+
+    /* not on the connection pool (e.g. a cached response): via the request */
 
     r = c->data;
 
@@ -4958,11 +5183,7 @@ ngx_http_proxy_v2_cached(ngx_http_request_t *r)
 static void
 ngx_http_proxy_v2_cleanup(void *data)
 {
-#if 0
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                   "http proxy cleanup");
-#endif
-    return;
+    /* only a marker to locate the connection data (see get_ctx) */
 }
 
 
@@ -4978,8 +5199,6 @@ ngx_http_proxy_v2_abort_request(ngx_http_request_t *r)
 static void
 ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
 {
-    ngx_connection_t         *fc;
-    ngx_http_upstream_t      *u;
     ngx_http_proxy_v2_ctx_t  *ctx;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -4990,6 +5209,18 @@ ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
     if (ctx == NULL || ctx->connection == NULL) {
         return;
     }
+
+    ngx_http_proxy_v2_detach(r, ctx);
+}
+
+
+static void
+ngx_http_proxy_v2_detach(ngx_http_request_t *r, ngx_http_proxy_v2_ctx_t *ctx)
+{
+    ngx_connection_t     *c, *fc;
+    ngx_http_upstream_t  *u;
+
+    u = r->upstream;
 
     if (ctx->fc != NULL) {
         fc = ctx->fc;
@@ -5018,12 +5249,10 @@ ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
         }
 
         /*
-         * unwrap: hand the real connection back to u->peer.connection so the
-         * upstream module can return it to the keepalive cache (this runs
-         * before u->peer.free() in ngx_http_upstream_finalize_request())
+         * Hand the real connection back to u->peer.connection so the keepalive
+         * module returns it to the cache (or closes it) instead of the fake
+         * one, whose pool and descriptor alias the real connection.
          */
-
-        u = r->upstream;
 
         if (u != NULL && u->peer.connection == fc) {
             u->peer.connection = ctx->connection->connection;
@@ -5032,7 +5261,57 @@ ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
         ctx->fc = NULL;
     }
 
-    ngx_http_proxy_v2_stream_unregister(ctx);
+    /* restore the peer's free handler wrapped by init_stream() */
 
-    return;
+    if (u != NULL && ctx->original_free != NULL) {
+        u->peer.free = ctx->original_free;
+    }
+
+    ngx_http_proxy_v2_stream_unregister(r, ctx);
+
+    /*
+     * The real connection's c->data may still point at r, which is about to be
+     * freed while the connection keeps serving other streams; repoint it at a
+     * surviving stream's request (or NULL) so it never dangles.
+     */
+
+    c = ctx->connection->connection;
+
+    if (c != NULL && c->data == r) {
+        if (ctx->connection->active != NULL) {
+            c->data = ctx->connection->active->fc->data;
+        } else {
+            c->data = NULL;
+        }
+    }
+}
+
+
+static void
+ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
+    ngx_uint_t state)
+{
+    ngx_connection_t         *fc;
+    ngx_http_request_t       *r;
+    ngx_event_free_peer_pt    original_free;
+    ngx_http_proxy_v2_ctx_t  *ctx;
+
+    /*
+     * Reached from ngx_http_upstream_next() on a stream failure, with the fake
+     * connection still assigned to u->peer.connection (u->finalize_request()
+     * has not run and so has not restored this handler).  Reverse it to the
+     * real connection before the keepalive module and the connection teardown
+     * that follows in ngx_http_upstream_next() look at it, so that one failed
+     * stream does not tear down a connection shared with other streams.
+     */
+
+    fc = pc->connection;
+    r = fc->data;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
+    original_free = ctx->original_free;
+
+    ngx_http_proxy_v2_detach(r, ctx);
+
+    original_free(pc, data, state);
 }
