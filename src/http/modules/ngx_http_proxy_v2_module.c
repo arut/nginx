@@ -26,6 +26,10 @@ typedef enum {
 } ngx_http_proxy_v2_state_e;
 
 
+#define NGX_HTTP_PROXY_V2_DEMUX_BUFFER  65536
+#define NGX_HTTP_PROXY_V2_FRAME_HEADER  9
+
+
 typedef struct ngx_http_proxy_v2_ctx_s  ngx_http_proxy_v2_ctx_t;
 
 
@@ -47,6 +51,16 @@ typedef struct {
 
     /* peer's SETTINGS_MAX_CONCURRENT_STREAMS (0 until received) */
     ngx_uint_t                     max_streams;
+
+    /*
+     * connection-level demultiplexer: raw bytes are read from the real socket
+     * into "buffer", and whole frames are handed to the stream they belong to.
+     * frame_stream/frame_rest track the frame currently being handed out (0
+     * frame_rest means the next 9 bytes in the buffer are a new frame header).
+     */
+    ngx_buf_t                     *buffer;
+    ngx_uint_t                     frame_stream;
+    size_t                         frame_rest;
 
     /*
      * the real backend connection carrying the multiplexed HTTP/2 session;
@@ -203,6 +217,11 @@ static ssize_t ngx_http_proxy_v2_send(ngx_connection_t *fc, u_char *buf,
 static ngx_chain_t *ngx_http_proxy_v2_send_chain(ngx_connection_t *fc,
     ngx_chain_t *in, off_t limit);
 static ngx_http_proxy_v2_conn_t *ngx_http_proxy_v2_conn(ngx_connection_t *c);
+static ssize_t ngx_http_proxy_v2_fill(ngx_http_proxy_v2_conn_t *h2c);
+static ssize_t ngx_http_proxy_v2_read_stream(ngx_http_proxy_v2_conn_t *h2c,
+    ngx_uint_t id, u_char *buf, size_t size);
+static void ngx_http_proxy_v2_activate(ngx_http_proxy_v2_conn_t *h2c,
+    ngx_uint_t id);
 static void ngx_http_proxy_v2_demux_read(ngx_event_t *rev);
 static void ngx_http_proxy_v2_demux_write(ngx_event_t *wev);
 static void ngx_http_proxy_v2_stream_register(ngx_http_proxy_v2_ctx_t *ctx);
@@ -4345,6 +4364,10 @@ done:
                     ngx_rbtree_insert_value);
     ctx->connection->active = NULL;
     ctx->connection->processing = 0;
+    ctx->connection->max_streams = 0;
+    ctx->connection->buffer = NULL;
+    ctx->connection->frame_stream = 0;
+    ctx->connection->frame_rest = 0;
 
     ngx_http_proxy_v2_stream_register(ctx);
 
@@ -4514,34 +4537,27 @@ static ssize_t
 ngx_http_proxy_v2_recv(ngx_connection_t *fc, u_char *buf, size_t size)
 {
     ssize_t                   n;
-    ngx_connection_t         *c;
     ngx_http_request_t       *r;
     ngx_http_proxy_v2_ctx_t  *ctx;
 
     r = fc->data;
     ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
-    c = ctx->connection->connection;
 
-    n = c->recv(c, buf, size);
+    n = ngx_http_proxy_v2_read_stream(ctx->connection, ctx->id, buf, size);
 
     if (n == NGX_ERROR) {
         fc->read->error = 1;
         return NGX_ERROR;
     }
 
-    fc->read->ready = c->read->ready;
-    fc->read->eof = c->read->eof;
+    if (n == NGX_AGAIN) {
+        fc->read->ready = 0;
+        return NGX_AGAIN;
+    }
 
-    /*
-     * When the real socket is drained, register its read event so that the
-     * demux read handler is woken; the fake event is never (un)registered.
-     */
-
-    if (!c->read->ready) {
-        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-            fc->read->error = 1;
-            return NGX_ERROR;
-        }
+    if (n == 0) {
+        fc->read->eof = 1;
+        fc->read->ready = 0;
     }
 
     return n;
@@ -4552,33 +4568,71 @@ static ssize_t
 ngx_http_proxy_v2_recv_chain(ngx_connection_t *fc, ngx_chain_t *chain,
     off_t limit)
 {
-    ssize_t                   n;
-    ngx_connection_t         *c;
+    size_t                    size;
+    ssize_t                   n, total;
+    ngx_buf_t                *b;
     ngx_http_request_t       *r;
     ngx_http_proxy_v2_ctx_t  *ctx;
 
     r = fc->data;
     ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
-    c = ctx->connection->connection;
 
-    n = c->recv_chain(c, chain, limit);
+    total = 0;
 
-    if (n == NGX_ERROR) {
-        fc->read->error = 1;
-        return NGX_ERROR;
-    }
+    while (chain) {
+        b = chain->buf;
 
-    fc->read->ready = c->read->ready;
-    fc->read->eof = c->read->eof;
+        size = b->end - b->last;
 
-    if (!c->read->ready) {
-        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-            fc->read->error = 1;
-            return NGX_ERROR;
+        if (limit && (off_t) (total + size) > limit) {
+            size = (size_t) (limit - total);
+
+            if (size == 0) {
+                break;
+            }
         }
+
+        n = ngx_http_proxy_v2_read_stream(ctx->connection, ctx->id,
+                                          b->last, size);
+
+        if (n == NGX_ERROR) {
+            fc->read->error = 1;
+            return total ? total : NGX_ERROR;
+        }
+
+        if (n == NGX_AGAIN) {
+            fc->read->ready = 0;
+            return total ? total : NGX_AGAIN;
+        }
+
+        if (n == 0) {
+            fc->read->eof = 1;
+            fc->read->ready = 0;
+            return total;
+        }
+
+        /*
+         * Like ngx_readv_chain(), the buffer is filled but its ->last is not
+         * advanced here: the caller (event pipe) distributes the returned
+         * byte count across the chain buffers itself.
+         */
+
+        total += n;
+
+        if ((size_t) n < size) {
+            /* nothing more for this stream right now */
+            fc->read->ready = 0;
+            break;
+        }
+
+        if (limit && total >= limit) {
+            break;
+        }
+
+        chain = chain->next;
     }
 
-    return n;
+    return total;
 }
 
 
@@ -4679,6 +4733,168 @@ ngx_http_proxy_v2_conn(ngx_connection_t *c)
     }
 
     return ctx->connection;
+}
+
+
+/*
+ * Read raw bytes from the real backend connection into the connection-level
+ * demux buffer, compacting any unconsumed remainder to the front first.
+ * Returns the number of bytes just read, or NGX_AGAIN/0/NGX_ERROR.
+ */
+
+static ssize_t
+ngx_http_proxy_v2_fill(ngx_http_proxy_v2_conn_t *h2c)
+{
+    size_t             size;
+    ssize_t            n;
+    ngx_buf_t         *b;
+    ngx_connection_t  *c;
+
+    c = h2c->connection;
+    b = h2c->buffer;
+
+    if (b == NULL) {
+        b = ngx_create_temp_buf(c->pool, NGX_HTTP_PROXY_V2_DEMUX_BUFFER);
+        if (b == NULL) {
+            return NGX_ERROR;
+        }
+
+        h2c->buffer = b;
+    }
+
+    if (b->pos > b->start) {
+        /* compact the unconsumed remainder to the front */
+
+        size = b->last - b->pos;
+        ngx_memmove(b->start, b->pos, size);
+        b->pos = b->start;
+        b->last = b->start + size;
+    }
+
+    if (b->last == b->end) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "upstream sent too large http2 frame header");
+        return NGX_ERROR;
+    }
+
+    n = c->recv(c, b->last, b->end - b->last);
+
+    if (n == NGX_ERROR || n == 0) {
+        return n;
+    }
+
+    if (n > 0) {
+        b->last += n;
+    }
+
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return n;
+}
+
+
+/*
+ * Hand out bytes belonging to stream "id" (plus connection-level frames on
+ * stream 0) from the demux buffer, reading more from the socket as needed.
+ * A frame addressed to another stream stops the read and activates that
+ * stream.  Returns the number of bytes copied, or NGX_AGAIN/0/NGX_ERROR.
+ */
+
+static ssize_t
+ngx_http_proxy_v2_read_stream(ngx_http_proxy_v2_conn_t *h2c, ngx_uint_t id,
+    u_char *buf, size_t size)
+{
+    u_char     *p;
+    size_t      total, n;
+    ssize_t     rc;
+    ngx_buf_t  *b;
+
+    total = 0;
+
+    for ( ;; ) {
+
+        b = h2c->buffer;
+
+        if (h2c->frame_rest == 0) {
+
+            /* need a full frame header to route the next frame */
+
+            while (b == NULL
+                   || (size_t) (b->last - b->pos)
+                      < NGX_HTTP_PROXY_V2_FRAME_HEADER)
+            {
+                rc = ngx_http_proxy_v2_fill(h2c);
+                b = h2c->buffer;
+
+                if (rc == NGX_AGAIN || rc == 0 || rc == NGX_ERROR) {
+                    return total ? (ssize_t) total : rc;
+                }
+            }
+
+            p = b->pos;
+
+            h2c->frame_rest = NGX_HTTP_PROXY_V2_FRAME_HEADER
+                              + ((p[0] << 16) + (p[1] << 8) + p[2]);
+
+            h2c->frame_stream = ((ngx_uint_t) (p[5] & 0x7f) << 24)
+                                + (p[6] << 16) + (p[7] << 8) + p[8];
+        }
+
+        if (h2c->frame_stream != id && h2c->frame_stream != 0) {
+
+            /* the next frame belongs to another stream */
+
+            ngx_http_proxy_v2_activate(h2c, h2c->frame_stream);
+            return total ? (ssize_t) total : NGX_AGAIN;
+        }
+
+        if (total == size) {
+            return total;
+        }
+
+        if (b == NULL || b->pos == b->last) {
+            rc = ngx_http_proxy_v2_fill(h2c);
+            b = h2c->buffer;
+
+            if (rc == NGX_AGAIN || rc == 0 || rc == NGX_ERROR) {
+                return total ? (ssize_t) total : rc;
+            }
+        }
+
+        n = ngx_min(h2c->frame_rest, size - total);
+        n = ngx_min(n, (size_t) (b->last - b->pos));
+
+        ngx_memcpy(buf + total, b->pos, n);
+
+        b->pos += n;
+        total += n;
+        h2c->frame_rest -= n;
+    }
+}
+
+
+static void
+ngx_http_proxy_v2_activate(ngx_http_proxy_v2_conn_t *h2c, ngx_uint_t id)
+{
+    ngx_event_t              *rev;
+    ngx_http_proxy_v2_ctx_t  *stream;
+
+    stream = ngx_http_proxy_v2_stream_lookup(h2c, id);
+
+    if (stream == NULL || stream->fc == NULL) {
+        return;
+    }
+
+    h2c->active = stream;
+
+    rev = stream->fc->read;
+    rev->ready = 1;
+
+    if (!rev->posted) {
+        ngx_post_event(rev, &ngx_posted_events);
+    }
 }
 
 
