@@ -26,15 +26,38 @@ typedef enum {
 } ngx_http_proxy_v2_state_e;
 
 
+typedef struct ngx_http_proxy_v2_ctx_s  ngx_http_proxy_v2_ctx_t;
+
+
 typedef struct {
     size_t                         init_window;
     size_t                         send_window;
     size_t                         recv_window;
     ngx_uint_t                     last_stream_id;
+
+    /* multiplexing: streams on this connection, keyed by stream id */
+    ngx_rbtree_t                   streams;
+    ngx_rbtree_node_t              streams_sentinel;
+
+    /* the stream whose data is currently being read, if any */
+    ngx_http_proxy_v2_ctx_t       *active;
+
+    /* number of active streams */
+    ngx_uint_t                     processing;
+
+    /* peer's SETTINGS_MAX_CONCURRENT_STREAMS (0 until received) */
+    ngx_uint_t                     max_streams;
+
+    /*
+     * the real backend connection carrying the multiplexed HTTP/2 session;
+     * each stream reads and writes through its fake connection (ctx->fc),
+     * whose recv/send forward here
+     */
+    ngx_connection_t              *connection;
 } ngx_http_proxy_v2_conn_t;
 
 
-typedef struct {
+struct ngx_http_proxy_v2_ctx_s {
     ngx_http_proxy_ctx_t           ctx;
 
     ngx_http_proxy_v2_state_e      state;
@@ -47,6 +70,12 @@ typedef struct {
     ngx_chain_t                   *busy;
 
     ngx_http_proxy_v2_conn_t      *connection;
+
+    /* this stream's fake connection, assigned to u->peer.connection */
+    ngx_connection_t              *fc;
+
+    /* node in connection->streams, keyed by stream id */
+    ngx_rbtree_node_t              node;
 
     ngx_uint_t                     id;
 
@@ -94,7 +123,8 @@ typedef struct {
     unsigned                       status:1;
     unsigned                       rst:1;
     unsigned                       goaway:1;
-} ngx_http_proxy_v2_ctx_t;
+    unsigned                       registered:1;
+};
 
 
 typedef struct {
@@ -163,6 +193,22 @@ static ngx_int_t ngx_http_proxy_v2_get_connection_data(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx, ngx_peer_connection_t *pc);
 static ngx_inline ngx_int_t ngx_http_proxy_v2_cached(ngx_http_request_t *r);
 static void ngx_http_proxy_v2_cleanup(void *data);
+static ngx_int_t ngx_http_proxy_v2_init_stream(ngx_http_request_t *r);
+static ssize_t ngx_http_proxy_v2_recv(ngx_connection_t *fc, u_char *buf,
+    size_t size);
+static ssize_t ngx_http_proxy_v2_recv_chain(ngx_connection_t *fc,
+    ngx_chain_t *chain, off_t limit);
+static ssize_t ngx_http_proxy_v2_send(ngx_connection_t *fc, u_char *buf,
+    size_t size);
+static ngx_chain_t *ngx_http_proxy_v2_send_chain(ngx_connection_t *fc,
+    ngx_chain_t *in, off_t limit);
+static ngx_http_proxy_v2_conn_t *ngx_http_proxy_v2_conn(ngx_connection_t *c);
+static void ngx_http_proxy_v2_demux_read(ngx_event_t *rev);
+static void ngx_http_proxy_v2_demux_write(ngx_event_t *wev);
+static void ngx_http_proxy_v2_stream_register(ngx_http_proxy_v2_ctx_t *ctx);
+static void ngx_http_proxy_v2_stream_unregister(ngx_http_proxy_v2_ctx_t *ctx);
+static ngx_http_proxy_v2_ctx_t *ngx_http_proxy_v2_stream_lookup(
+    ngx_http_proxy_v2_conn_t *h2c, ngx_uint_t id);
 
 static void ngx_http_proxy_v2_abort_request(ngx_http_request_t *r);
 static void ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r,
@@ -272,6 +318,7 @@ ngx_http_proxy_v2_handler(ngx_http_request_t *r)
 
     u->create_request = ngx_http_proxy_v2_create_request;
     u->reinit_request = ngx_http_proxy_v2_reinit_request;
+    u->init_stream = ngx_http_proxy_v2_init_stream;
     u->process_header = ngx_http_proxy_v2_process_header;
     u->abort_request = ngx_http_proxy_v2_abort_request;
     u->finalize_request = ngx_http_proxy_v2_finalize_request;
@@ -2228,7 +2275,18 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
                 }
             }
 
-            if (ctx->stream_id && ctx->stream_id != ctx->id) {
+            /*
+             * Look the target stream up in the connection's stream tree.
+             * With a single active stream this resolves to the current one;
+             * this is the seam where multiplexing will instead stop the read
+             * and activate the frame's stream (conn->active).
+             */
+
+            if (ctx->stream_id
+                && ngx_http_proxy_v2_stream_lookup(ctx->connection,
+                                                   ctx->stream_id)
+                   != ctx)
+            {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                               "upstream sent frame for unknown stream %ui",
                               ctx->stream_id);
@@ -3850,6 +3908,16 @@ ngx_http_proxy_v2_parse_settings(ngx_http_request_t *r,
              * a simple client.
              */
 
+            if (ctx->setting_id == 0x03) {
+                /* SETTINGS_MAX_CONCURRENT_STREAMS */
+
+                ctx->connection->max_streams = ctx->setting_value;
+
+                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "http proxy http2 max concurrent streams:%ui",
+                               ctx->setting_value);
+            }
+
             if (ctx->setting_id == 0x04) {
                 /* SETTINGS_INITIAL_WINDOW_SIZE */
 
@@ -4246,6 +4314,8 @@ ngx_http_proxy_v2_get_connection_data(ngx_http_request_t *r,
         ctx->connection->last_stream_id += 2;
         ctx->id = ctx->connection->last_stream_id;
 
+        ngx_http_proxy_v2_stream_register(ctx);
+
         return NGX_OK;
     }
 
@@ -4270,7 +4340,391 @@ done:
 
     ctx->connection->last_stream_id = 1;
 
+    ngx_rbtree_init(&ctx->connection->streams,
+                    &ctx->connection->streams_sentinel,
+                    ngx_rbtree_insert_value);
+    ctx->connection->active = NULL;
+    ctx->connection->processing = 0;
+
+    ngx_http_proxy_v2_stream_register(ctx);
+
     return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_stream_register(ngx_http_proxy_v2_ctx_t *ctx)
+{
+    ctx->node.key = ctx->id;
+
+    ngx_rbtree_insert(&ctx->connection->streams, &ctx->node);
+
+    ctx->connection->processing++;
+    ctx->registered = 1;
+}
+
+
+static void
+ngx_http_proxy_v2_stream_unregister(ngx_http_proxy_v2_ctx_t *ctx)
+{
+    if (!ctx->registered) {
+        return;
+    }
+
+    ngx_rbtree_delete(&ctx->connection->streams, &ctx->node);
+
+    ctx->connection->processing--;
+    ctx->registered = 0;
+
+    if (ctx->connection->active == ctx) {
+        ctx->connection->active = NULL;
+    }
+}
+
+
+static ngx_http_proxy_v2_ctx_t *
+ngx_http_proxy_v2_stream_lookup(ngx_http_proxy_v2_conn_t *h2c, ngx_uint_t id)
+{
+    ngx_rbtree_node_t  *node, *sentinel;
+
+    node = h2c->streams.root;
+    sentinel = h2c->streams.sentinel;
+
+    while (node != sentinel) {
+
+        if ((ngx_rbtree_key_t) id < node->key) {
+            node = node->left;
+            continue;
+        }
+
+        if ((ngx_rbtree_key_t) id > node->key) {
+            node = node->right;
+            continue;
+        }
+
+        /* id == node->key */
+
+        return (ngx_http_proxy_v2_ctx_t *)
+                   ((u_char *) node
+                    - offsetof(ngx_http_proxy_v2_ctx_t, node));
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Wrap the real backend HTTP/2 connection in a per-stream fake connection.
+ *
+ * The upstream module drives read/write through u->peer.connection.  To let
+ * it work on one stream while the real connection is shared, we assign a fake
+ * connection (fc) to u->peer.connection and forward its recv/send to the real
+ * connection.  fc's events are kept "ready" so the upstream's
+ * ngx_handle_read_event()/ngx_handle_write_event() calls stay no-ops (they do
+ * not touch epoll for a ready event); the real connection's events, driven by
+ * the demux handlers below, wake the active stream's fc.
+ *
+ * The reverse is done in ngx_http_proxy_v2_finalize_request(), after which the
+ * real connection can be returned to the keepalive cache.
+ */
+
+static ngx_int_t
+ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
+{
+    ngx_event_t               *rev, *wev;
+    ngx_connection_t          *c, *fc;
+    ngx_http_upstream_t       *u;
+    ngx_http_proxy_v2_ctx_t   *ctx;
+    ngx_http_proxy_v2_conn_t  *h2c;
+
+    u = r->upstream;
+    c = u->peer.connection;
+
+    ctx = ngx_http_proxy_v2_get_ctx(r);
+    if (ctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    h2c = ctx->connection;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "http proxy http2 init stream %ui", ctx->id);
+
+    fc = ngx_palloc(r->pool, sizeof(ngx_connection_t));
+    rev = ngx_palloc(r->pool, sizeof(ngx_event_t));
+    wev = ngx_palloc(r->pool, sizeof(ngx_event_t));
+
+    if (fc == NULL || rev == NULL || wev == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(fc, c, sizeof(ngx_connection_t));
+
+    /*
+     * The fake connection shares the real descriptor (so getsockopt()-based
+     * checks such as ngx_http_upstream_test_connect() keep working), but I/O
+     * is forwarded to the real connection.  The fake events are kept "active"
+     * so that the upstream module's ngx_handle_read_event()/write_event()
+     * calls never try to (un)register them in the event engine (which would
+     * disturb the real connection's registration); "ready" still tracks data
+     * availability so the generic read/write loops terminate correctly.
+     */
+
+    ngx_memzero(rev, sizeof(ngx_event_t));
+    rev->data = fc;
+    rev->ready = 1;
+    rev->active = 1;
+    rev->handler = c->read->handler;   /* ngx_http_upstream_handler */
+    rev->log = c->log;
+
+    ngx_memcpy(wev, rev, sizeof(ngx_event_t));
+    wev->write = 1;
+
+    fc->read = rev;
+    fc->write = wev;
+    fc->data = r;
+    fc->recv = ngx_http_proxy_v2_recv;
+    fc->send = ngx_http_proxy_v2_send;
+    fc->recv_chain = ngx_http_proxy_v2_recv_chain;
+    fc->send_chain = ngx_http_proxy_v2_send_chain;
+
+    ctx->fc = fc;
+
+    /* the real connection is now demultiplexed by the handlers below */
+
+    h2c->connection = c;
+    h2c->active = ctx;
+
+    /*
+     * c->data stays pointing at the request (the upstream and the client-side
+     * SSL session callback rely on it); the demux handlers recover h2c through
+     * c->data -> ctx -> connection.
+     */
+
+    c->read->handler = ngx_http_proxy_v2_demux_read;
+    c->write->handler = ngx_http_proxy_v2_demux_write;
+
+    u->peer.connection = fc;
+
+    return NGX_OK;
+}
+
+
+static ssize_t
+ngx_http_proxy_v2_recv(ngx_connection_t *fc, u_char *buf, size_t size)
+{
+    ssize_t                   n;
+    ngx_connection_t         *c;
+    ngx_http_request_t       *r;
+    ngx_http_proxy_v2_ctx_t  *ctx;
+
+    r = fc->data;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
+    c = ctx->connection->connection;
+
+    n = c->recv(c, buf, size);
+
+    if (n == NGX_ERROR) {
+        fc->read->error = 1;
+        return NGX_ERROR;
+    }
+
+    fc->read->ready = c->read->ready;
+    fc->read->eof = c->read->eof;
+
+    /*
+     * When the real socket is drained, register its read event so that the
+     * demux read handler is woken; the fake event is never (un)registered.
+     */
+
+    if (!c->read->ready) {
+        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+            fc->read->error = 1;
+            return NGX_ERROR;
+        }
+    }
+
+    return n;
+}
+
+
+static ssize_t
+ngx_http_proxy_v2_recv_chain(ngx_connection_t *fc, ngx_chain_t *chain,
+    off_t limit)
+{
+    ssize_t                   n;
+    ngx_connection_t         *c;
+    ngx_http_request_t       *r;
+    ngx_http_proxy_v2_ctx_t  *ctx;
+
+    r = fc->data;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
+    c = ctx->connection->connection;
+
+    n = c->recv_chain(c, chain, limit);
+
+    if (n == NGX_ERROR) {
+        fc->read->error = 1;
+        return NGX_ERROR;
+    }
+
+    fc->read->ready = c->read->ready;
+    fc->read->eof = c->read->eof;
+
+    if (!c->read->ready) {
+        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+            fc->read->error = 1;
+            return NGX_ERROR;
+        }
+    }
+
+    return n;
+}
+
+
+static ssize_t
+ngx_http_proxy_v2_send(ngx_connection_t *fc, u_char *buf, size_t size)
+{
+    ssize_t                   n;
+    ngx_connection_t         *c;
+    ngx_http_request_t       *r;
+    ngx_http_proxy_v2_ctx_t  *ctx;
+
+    r = fc->data;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
+    c = ctx->connection->connection;
+
+    n = c->send(c, buf, size);
+
+    if (n == NGX_ERROR) {
+        fc->write->error = 1;
+        return NGX_ERROR;
+    }
+
+    fc->write->ready = c->write->ready;
+
+    if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+        fc->write->error = 1;
+        return NGX_ERROR;
+    }
+
+    if (n > 0) {
+        fc->sent += n;
+    }
+
+    return n;
+}
+
+
+static ngx_chain_t *
+ngx_http_proxy_v2_send_chain(ngx_connection_t *fc, ngx_chain_t *in, off_t limit)
+{
+    off_t                     sent;
+    ngx_chain_t              *cl;
+    ngx_connection_t         *c;
+    ngx_http_request_t       *r;
+    ngx_http_proxy_v2_ctx_t  *ctx;
+
+    r = fc->data;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
+    c = ctx->connection->connection;
+
+    sent = c->sent;
+
+    cl = c->send_chain(c, in, limit);
+
+    fc->sent += c->sent - sent;
+
+    if (cl == NGX_CHAIN_ERROR) {
+        fc->write->error = 1;
+        fc->error = 1;
+        return NGX_CHAIN_ERROR;
+    }
+
+    fc->write->ready = c->write->ready;
+
+    if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+        fc->write->error = 1;
+        fc->error = 1;
+        return NGX_CHAIN_ERROR;
+    }
+
+    return cl;
+}
+
+
+/*
+ * The real connection's read/write events fire on socket readiness.  Wake the
+ * active stream's fake connection so the upstream module reads or writes it.
+ * When multiplexing is added, this is where the connection-level frame parser
+ * will demultiplex frames and pick which stream(s) to activate.
+ */
+
+static ngx_http_proxy_v2_conn_t *
+ngx_http_proxy_v2_conn(ngx_connection_t *c)
+{
+    ngx_http_request_t       *r;
+    ngx_http_proxy_v2_ctx_t  *ctx;
+
+    r = c->data;
+
+    if (r == NULL) {
+        return NULL;
+    }
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
+
+    if (ctx == NULL) {
+        return NULL;
+    }
+
+    return ctx->connection;
+}
+
+
+static void
+ngx_http_proxy_v2_demux_read(ngx_event_t *rev)
+{
+    ngx_event_t               *fcev;
+    ngx_connection_t          *c;
+    ngx_http_proxy_v2_conn_t  *h2c;
+
+    c = rev->data;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "http proxy http2 demux read");
+
+    h2c = ngx_http_proxy_v2_conn(c);
+    if (h2c == NULL || h2c->active == NULL) {
+        return;
+    }
+
+    fcev = h2c->active->fc->read;
+    fcev->ready = 1;
+    fcev->handler(fcev);
+}
+
+
+static void
+ngx_http_proxy_v2_demux_write(ngx_event_t *wev)
+{
+    ngx_event_t               *fcev;
+    ngx_connection_t          *c;
+    ngx_http_proxy_v2_conn_t  *h2c;
+
+    c = wev->data;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "http proxy http2 demux write");
+
+    h2c = ngx_http_proxy_v2_conn(c);
+    if (h2c == NULL || h2c->active == NULL) {
+        return;
+    }
+
+    fcev = h2c->active->fc->write;
+    fcev->ready = 1;
+    fcev->handler(fcev);
 }
 
 
@@ -4308,7 +4762,61 @@ ngx_http_proxy_v2_abort_request(ngx_http_request_t *r)
 static void
 ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
 {
+    ngx_connection_t         *fc;
+    ngx_http_upstream_t      *u;
+    ngx_http_proxy_v2_ctx_t  *ctx;
+
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "finalize proxy http2 request");
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
+
+    if (ctx == NULL || ctx->connection == NULL) {
+        return;
+    }
+
+    if (ctx->fc != NULL) {
+        fc = ctx->fc;
+
+        /*
+         * The fake connection and its events live in the request pool and are
+         * about to be freed.  The upstream added timers/posted events on them
+         * (as u->peer.connection); drop those references before we detach so
+         * nothing dangles once the pool is gone.
+         */
+
+        if (fc->read->timer_set) {
+            ngx_del_timer(fc->read);
+        }
+
+        if (fc->write->timer_set) {
+            ngx_del_timer(fc->write);
+        }
+
+        if (fc->read->posted) {
+            ngx_delete_posted_event(fc->read);
+        }
+
+        if (fc->write->posted) {
+            ngx_delete_posted_event(fc->write);
+        }
+
+        /*
+         * unwrap: hand the real connection back to u->peer.connection so the
+         * upstream module can return it to the keepalive cache (this runs
+         * before u->peer.free() in ngx_http_upstream_finalize_request())
+         */
+
+        u = r->upstream;
+
+        if (u != NULL && u->peer.connection == fc) {
+            u->peer.connection = ctx->connection->connection;
+        }
+
+        ctx->fc = NULL;
+    }
+
+    ngx_http_proxy_v2_stream_unregister(ctx);
+
     return;
 }

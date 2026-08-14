@@ -2179,6 +2179,17 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
         return;
     }
 
+    if (!u->request_sent && u->init_stream) {
+        if (u->init_stream(r) != NGX_OK) {
+            ngx_http_upstream_finalize_request(r, u,
+                                               NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        /* init_stream() swapped in the fake per-stream connection */
+        c = u->peer.connection;
+    }
+
     c->log->action = "sending request to upstream";
 
     rc = ngx_http_upstream_send_request_body(r, u, do_write);
