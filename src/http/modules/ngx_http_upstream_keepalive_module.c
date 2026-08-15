@@ -438,6 +438,7 @@ close:
 static void
 ngx_http_upstream_keepalive_close(ngx_connection_t *c)
 {
+    ngx_pool_t  *pool;
 
 #if (NGX_HTTP_SSL)
 
@@ -453,8 +454,11 @@ ngx_http_upstream_keepalive_close(ngx_connection_t *c)
 
 #endif
 
-    ngx_destroy_pool(c->pool);
+    pool = c->pool;
+
     ngx_close_connection(c);
+
+    ngx_destroy_pool(pool);
 }
 
 

@@ -4610,8 +4610,9 @@ static void
 ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_uint_t ft_type)
 {
-    ngx_msec_t  timeout;
-    ngx_uint_t  status, state;
+    ngx_pool_t  *pool;
+    ngx_msec_t   timeout;
+    ngx_uint_t   status, state;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http next upstream, %xi", ft_type);
@@ -4754,11 +4755,14 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
         }
 #endif
 
-        if (u->peer.connection->pool) {
-            ngx_destroy_pool(u->peer.connection->pool);
-        }
+        pool = u->peer.connection->pool;
 
         ngx_close_connection(u->peer.connection);
+
+        if (pool) {
+            ngx_destroy_pool(pool);
+        }
+
         u->peer.connection = NULL;
     }
 
@@ -4782,7 +4786,8 @@ static void
 ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     ngx_http_upstream_t *u, ngx_int_t rc)
 {
-    ngx_uint_t  flush;
+    ngx_pool_t  *pool;
+    ngx_uint_t   flush;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "finalize http upstream request: %i", rc);
@@ -4850,11 +4855,13 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
                        "close http upstream connection: %d",
                        u->peer.connection->fd);
 
-        if (u->peer.connection->pool) {
-            ngx_destroy_pool(u->peer.connection->pool);
-        }
+        pool = u->peer.connection->pool;
 
         ngx_close_connection(u->peer.connection);
+
+        if (pool) {
+            ngx_destroy_pool(pool);
+        }
     }
 
     u->peer.connection = NULL;
