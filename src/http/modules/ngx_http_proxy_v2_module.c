@@ -29,6 +29,12 @@ typedef enum {
 #define NGX_HTTP_PROXY_V2_DEMUX_BUFFER  65536
 #define NGX_HTTP_PROXY_V2_FRAME_HEADER  9
 
+/* room for a few pending connection-level control frames (13 bytes each) */
+#define NGX_HTTP_PROXY_V2_OUT_SIZE      256
+
+/* RST_STREAM error code CANCEL (RFC 7540, 7) */
+#define NGX_HTTP_PROXY_V2_CANCEL        0x8
+
 
 typedef struct ngx_http_proxy_v2_ctx_s  ngx_http_proxy_v2_ctx_t;
 
@@ -73,7 +79,18 @@ typedef struct {
      */
     ngx_buf_t                     *buffer;
     ngx_uint_t                     frame_stream;
+    ngx_uint_t                     frame_type;
     size_t                         frame_rest;
+
+    /*
+     * connection-level output: small control frames (RST_STREAM for cancelled
+     * streams, connection-level WINDOW_UPDATE for their discarded data) that do
+     * not belong to any one stream.  Bytes are sent straight to the connection;
+     * a partial write keeps the remainder here to be flushed on write-ready.
+     */
+    u_char                        *out_pos;
+    u_char                        *out_last;
+    u_char                         out_buf[NGX_HTTP_PROXY_V2_OUT_SIZE];
 
     /*
      * the real backend connection carrying the multiplexed HTTP/2 session;
@@ -260,6 +277,13 @@ static void ngx_http_proxy_v2_detach(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx);
 static void ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
     ngx_uint_t state);
+static ngx_int_t ngx_http_proxy_v2_conn_flush(ngx_http_proxy_v2_conn_t *h2c);
+static u_char *ngx_http_proxy_v2_conn_frame(ngx_http_proxy_v2_conn_t *h2c,
+    size_t len);
+static void ngx_http_proxy_v2_conn_rst_stream(ngx_http_proxy_v2_conn_t *h2c,
+    ngx_uint_t id, ngx_uint_t error);
+static void ngx_http_proxy_v2_conn_consume(ngx_http_proxy_v2_conn_t *h2c,
+    size_t len);
 
 static void ngx_http_proxy_v2_abort_request(ngx_http_request_t *r);
 static void ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r,
@@ -4431,7 +4455,10 @@ done:
     ctx->connection->connection = NULL;
     ctx->connection->buffer = NULL;
     ctx->connection->frame_stream = 0;
+    ctx->connection->frame_type = 0;
     ctx->connection->frame_rest = 0;
+    ctx->connection->out_pos = ctx->connection->out_buf;
+    ctx->connection->out_last = ctx->connection->out_buf;
 
     ngx_http_proxy_v2_stream_register(r, ctx);
 
@@ -5063,16 +5090,59 @@ ngx_http_proxy_v2_read_stream(ngx_http_proxy_v2_conn_t *h2c, ngx_uint_t id,
             h2c->frame_rest = NGX_HTTP_PROXY_V2_FRAME_HEADER
                               + ((p[0] << 16) + (p[1] << 8) + p[2]);
 
+            h2c->frame_type = p[3];
+
             h2c->frame_stream = ((ngx_uint_t) (p[5] & 0x7f) << 24)
                                 + (p[6] << 16) + (p[7] << 8) + p[8];
+
+            /*
+             * A frame for a stream that is no longer here (typically one the
+             * client cancelled) must be discarded so it does not wedge the
+             * shared buffer.  Account its DATA against the connection window
+             * now, once, so discarding does not drain the shared window.
+             */
+
+            if (h2c->frame_stream != 0
+                && h2c->frame_stream != id
+                && h2c->frame_type == NGX_HTTP_V2_DATA_FRAME
+                && h2c->frame_rest > NGX_HTTP_PROXY_V2_FRAME_HEADER
+                && ngx_http_proxy_v2_stream_lookup(h2c, h2c->frame_stream)
+                   == NULL)
+            {
+                ngx_http_proxy_v2_conn_consume(h2c,
+                    h2c->frame_rest - NGX_HTTP_PROXY_V2_FRAME_HEADER);
+            }
         }
 
         if (h2c->frame_stream != id && h2c->frame_stream != 0) {
 
             /* the next frame belongs to another stream */
 
-            ngx_http_proxy_v2_activate(h2c, h2c->frame_stream);
-            return total ? (ssize_t) total : NGX_AGAIN;
+            if (ngx_http_proxy_v2_stream_lookup(h2c, h2c->frame_stream)
+                != NULL)
+            {
+                /* a live sibling reads its own frame */
+                ngx_http_proxy_v2_activate(h2c, h2c->frame_stream);
+                return total ? (ssize_t) total : NGX_AGAIN;
+            }
+
+            /* the stream is gone: discard the frame */
+
+            if (b == NULL || b->pos == b->last) {
+                rc = ngx_http_proxy_v2_fill(h2c);
+                b = h2c->buffer;
+
+                if (rc == NGX_AGAIN || rc == 0 || rc == NGX_ERROR) {
+                    return total ? (ssize_t) total : rc;
+                }
+            }
+
+            n = ngx_min(h2c->frame_rest, (size_t) (b->last - b->pos));
+
+            b->pos += n;
+            h2c->frame_rest -= n;
+
+            continue;
         }
 
         if (total == size) {
@@ -5159,7 +5229,15 @@ ngx_http_proxy_v2_demux_write(ngx_event_t *wev)
                    "http proxy http2 demux write");
 
     h2c = ngx_http_proxy_v2_conn(c);
-    if (h2c == NULL || h2c->active == NULL) {
+    if (h2c == NULL) {
+        return;
+    }
+
+    /* finish any pending connection-level control frames first */
+
+    (void) ngx_http_proxy_v2_conn_flush(h2c);
+
+    if (h2c->active == NULL) {
         return;
     }
 
@@ -5267,6 +5345,20 @@ ngx_http_proxy_v2_detach(ngx_http_request_t *r, ngx_http_proxy_v2_ctx_t *ctx)
         u->peer.free = ctx->original_free;
     }
 
+    /*
+     * If the stream is torn down before the backend finished it (a client
+     * cancel, an error), tell the backend to stop sending for it; any frames
+     * already in flight are discarded by the demux.
+     */
+
+    if (ctx->registered
+        && !ctx->done
+        && ctx->connection->connection != NULL)
+    {
+        ngx_http_proxy_v2_conn_rst_stream(ctx->connection, ctx->id,
+                                          NGX_HTTP_PROXY_V2_CANCEL);
+    }
+
     ngx_http_proxy_v2_stream_unregister(r, ctx);
 
     /*
@@ -5314,4 +5406,180 @@ ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
     ngx_http_proxy_v2_detach(r, ctx);
 
     original_free(pc, data, state);
+}
+
+
+/*
+ * Flush pending connection-level output to the real backend connection.
+ * On a partial write the remainder is compacted to the start of the buffer
+ * and the write event is registered so demux_write() finishes it later.
+ */
+
+static ngx_int_t
+ngx_http_proxy_v2_conn_flush(ngx_http_proxy_v2_conn_t *h2c)
+{
+    size_t             size;
+    ssize_t            n;
+    ngx_connection_t  *c;
+
+    c = h2c->connection;
+
+    if (c == NULL) {
+        return NGX_OK;
+    }
+
+    size = h2c->out_last - h2c->out_pos;
+
+    if (size == 0) {
+        return NGX_OK;
+    }
+
+    n = c->send(c, h2c->out_pos, size);
+
+    if (n == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+
+    if (n == NGX_AGAIN) {
+        n = 0;
+    }
+
+    h2c->out_pos += n;
+
+    if (h2c->out_pos == h2c->out_last) {
+        h2c->out_pos = h2c->out_buf;
+        h2c->out_last = h2c->out_buf;
+        return NGX_OK;
+    }
+
+    /* partial write: keep the rest and finish it on write-ready */
+
+    size = h2c->out_last - h2c->out_pos;
+    ngx_memmove(h2c->out_buf, h2c->out_pos, size);
+    h2c->out_pos = h2c->out_buf;
+    h2c->out_last = h2c->out_buf + size;
+
+    if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return NGX_AGAIN;
+}
+
+
+/*
+ * Reserve len bytes at the tail of the connection-level output buffer,
+ * flushing first if needed.  Returns NULL if the buffer is full (the frame is
+ * then dropped, which for these best-effort control frames only costs some
+ * upstream bandwidth until the stream's data ends).
+ */
+
+static u_char *
+ngx_http_proxy_v2_conn_frame(ngx_http_proxy_v2_conn_t *h2c, size_t len)
+{
+    u_char  *p;
+
+    if ((size_t) (h2c->out_buf + NGX_HTTP_PROXY_V2_OUT_SIZE - h2c->out_last)
+        < len)
+    {
+        (void) ngx_http_proxy_v2_conn_flush(h2c);
+
+        if ((size_t) (h2c->out_buf + NGX_HTTP_PROXY_V2_OUT_SIZE - h2c->out_last)
+            < len)
+        {
+            return NULL;
+        }
+    }
+
+    p = h2c->out_last;
+    h2c->out_last += len;
+
+    return p;
+}
+
+
+/* tell the backend to stop sending for a stream that is going away */
+
+static void
+ngx_http_proxy_v2_conn_rst_stream(ngx_http_proxy_v2_conn_t *h2c, ngx_uint_t id,
+    ngx_uint_t error)
+{
+    u_char  *p;
+
+    p = ngx_http_proxy_v2_conn_frame(h2c, NGX_HTTP_PROXY_V2_FRAME_HEADER + 4);
+    if (p == NULL) {
+        return;
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, h2c->connection->log, 0,
+                   "http proxy http2 send rst_stream %ui err:%ui", id, error);
+
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 4;
+    *p++ = NGX_HTTP_V2_RST_STREAM_FRAME;
+    *p++ = 0;
+    *p++ = (u_char) ((id >> 24) & 0xff);
+    *p++ = (u_char) ((id >> 16) & 0xff);
+    *p++ = (u_char) ((id >> 8) & 0xff);
+    *p++ = (u_char) (id & 0xff);
+    *p++ = (u_char) ((error >> 24) & 0xff);
+    *p++ = (u_char) ((error >> 16) & 0xff);
+    *p++ = (u_char) ((error >> 8) & 0xff);
+    *p++ = (u_char) (error & 0xff);
+
+    (void) ngx_http_proxy_v2_conn_flush(h2c);
+}
+
+
+/*
+ * Account len bytes of DATA discarded for a gone stream against the
+ * connection-level receive window, replenishing it (as the per-stream path
+ * does) so the shared window does not drain and stall the other streams.
+ */
+
+static void
+ngx_http_proxy_v2_conn_consume(ngx_http_proxy_v2_conn_t *h2c, size_t len)
+{
+    u_char  *p;
+    size_t   n;
+
+    if (h2c->recv_window < len) {
+        h2c->recv_window = 0;
+
+    } else {
+        h2c->recv_window -= len;
+    }
+
+    if (h2c->recv_window >= NGX_HTTP_V2_MAX_WINDOW / 4) {
+        return;
+    }
+
+    n = NGX_HTTP_V2_MAX_WINDOW - h2c->recv_window;
+
+    p = ngx_http_proxy_v2_conn_frame(h2c, NGX_HTTP_PROXY_V2_FRAME_HEADER + 4);
+    if (p == NULL) {
+        return;
+    }
+
+    h2c->recv_window = NGX_HTTP_V2_MAX_WINDOW;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, h2c->connection->log, 0,
+                   "http proxy http2 send connection window update %uz", n);
+
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 4;
+    *p++ = NGX_HTTP_V2_WINDOW_UPDATE_FRAME;
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = 0;
+    *p++ = (u_char) ((n >> 24) & 0xff);
+    *p++ = (u_char) ((n >> 16) & 0xff);
+    *p++ = (u_char) ((n >> 8) & 0xff);
+    *p++ = (u_char) (n & 0xff);
+
+    (void) ngx_http_proxy_v2_conn_flush(h2c);
 }
