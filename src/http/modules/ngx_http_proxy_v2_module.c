@@ -32,8 +32,9 @@ typedef enum {
 /* room for a few pending connection-level control frames (13 bytes each) */
 #define NGX_HTTP_PROXY_V2_OUT_SIZE      256
 
-/* RST_STREAM error code CANCEL (RFC 7540, 7) */
-#define NGX_HTTP_PROXY_V2_CANCEL        0x8
+/* RST_STREAM error codes (RFC 7540, 7) */
+#define NGX_HTTP_PROXY_V2_CANCEL          0x8
+#define NGX_HTTP_PROXY_V2_REFUSED_STREAM  0x7
 
 
 typedef struct ngx_http_proxy_v2_ctx_s  ngx_http_proxy_v2_ctx_t;
@@ -274,6 +275,8 @@ static void ngx_http_proxy_v2_stream_unregister(ngx_http_request_t *r,
 static ngx_http_proxy_v2_ctx_t *ngx_http_proxy_v2_stream_lookup(
     ngx_http_proxy_v2_conn_t *h2c, ngx_uint_t id);
 static void ngx_http_proxy_v2_detach(ngx_http_request_t *r,
+    ngx_http_proxy_v2_ctx_t *ctx);
+static void ngx_http_proxy_v2_not_processed(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx);
 static void ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
     ngx_uint_t state);
@@ -1656,6 +1659,22 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
                     return NGX_HTTP_UPSTREAM_INVALID_HEADER;
                 }
 
+                if (ctx->error == NGX_HTTP_PROXY_V2_REFUSED_STREAM) {
+
+                    /*
+                     * The peer refused the stream before processing it, so the
+                     * request can be retried (see not_processed()).  We do not
+                     * touch this connection's advertised capacity: forcing it
+                     * to zero would make the keepalive module hand the cached
+                     * connection out as a single-use one while its other
+                     * streams are still running.  The retry goes through the
+                     * balancer, which moves to the next server (or, with a
+                     * single server, does not retry at all).
+                     */
+
+                    ngx_http_proxy_v2_not_processed(r, ctx);
+                }
+
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                               "upstream rejected request with error %ui",
                               ctx->error);
@@ -2170,7 +2189,15 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
 
         if (ctx->stream_id < ctx->id) {
 
-            /* TODO: we can retry non-idempotent requests */
+            /*
+             * Our request is above the last stream the peer will process, so
+             * it was not processed and can be retried, even non-idempotent
+             * (the connection is already marked c->close above, so the retry
+             * lands elsewhere).  In the header phase NGX_ERROR here becomes an
+             * invalid-header failure, which proxy_next_upstream can retry.
+             */
+
+            ngx_http_proxy_v2_not_processed(r, ctx);
 
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                           "upstream sent goaway with error %ui",
@@ -5376,6 +5403,30 @@ ngx_http_proxy_v2_detach(ngx_http_request_t *r, ngx_http_proxy_v2_ctx_t *ctx)
             c->data = NULL;
         }
     }
+}
+
+
+/*
+ * The peer reported that this request was not processed -- a RST_STREAM with
+ * REFUSED_STREAM, or a GOAWAY whose last-stream-id is below ours.  Per RFC 7540
+ * such a request can be safely retried, even a non-idempotent one, so tell the
+ * upstream layer the request was not sent: ngx_http_upstream_next() then does
+ * not apply the non-idempotent restriction.  Whether it retries at all still
+ * depends on proxy_next_upstream (the failure is reported as an invalid
+ * header); the buffered request body, if any, is still available because only
+ * buffered requests are multiplexed.
+ */
+
+static void
+ngx_http_proxy_v2_not_processed(ngx_http_request_t *r,
+    ngx_http_proxy_v2_ctx_t *ctx)
+{
+    ngx_http_upstream_t  *u;
+
+    u = r->upstream;
+
+    u->request_sent = 0;
+    u->request_body_sent = 0;
 }
 
 
