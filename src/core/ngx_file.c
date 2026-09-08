@@ -565,6 +565,16 @@ ngx_add_path(ngx_conf_t *cf, ngx_path_t **slot)
                         return NGX_ERROR;
                     }
 
+                    if (p[i]->conf_file == NULL) {
+                        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                      "the path name \"%V\" has the same "
+                                      "name as default path, but the "
+                                      "different levels, you need to define "
+                                      "default path in http section",
+                                      &p[i]->name);
+                        return NGX_ERROR;
+                    }
+
                     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                       "the same path name \"%V\" in %s:%ui "
                                       "has the different levels than",
