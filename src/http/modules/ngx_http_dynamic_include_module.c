@@ -46,13 +46,44 @@ typedef struct {
 
     /* of ngx_http_core_srv_conf_t *, parsed from this file */
     ngx_array_t                   *servers;
+
+    ngx_queue_t                    names;    /* ngx_http_dynamic_name_t */
 } ngx_http_dynamic_file_t;
+
+
+/*
+ * The names of the servers listening on one address of the static
+ * configuration.  There are as many of these as there are addresses the
+ * dynamic servers listen on, which is why they are kept in a list.
+ */
+
+typedef struct {
+    ngx_queue_t                    queue;
+    ngx_http_addr_conf_t          *addr_conf;
+
+    ngx_rbtree_t                   names;    /* ngx_http_dynamic_name_t */
+    ngx_rbtree_node_t              sentinel;
+} ngx_http_dynamic_addr_t;
+
+
+typedef struct {
+    ngx_str_node_t                 sn;        /* server name, must be first */
+    ngx_queue_t                    queue;     /* in the file */
+
+    ngx_http_addr_conf_t          *addr_conf;
+    ngx_http_dynamic_addr_t       *addr;      /* set while in the tree */
+
+    ngx_http_core_srv_conf_t      *cscf;
+    ngx_http_dynamic_file_t       *file;
+} ngx_http_dynamic_name_t;
 
 
 typedef struct {
     ngx_rbtree_t                   rbtree;   /* by file name */
     ngx_rbtree_node_t              sentinel;
-    ngx_queue_t                    queue;    /* all servers */
+    ngx_queue_t                    queue;    /* all files */
+
+    ngx_queue_t                    addrs;    /* ngx_http_dynamic_addr_t */
 
     ngx_atomic_t                   rwlock;
     ngx_uint_t                     generation;
@@ -83,20 +114,25 @@ static ngx_int_t ngx_http_dynamic_include_reload(ngx_cycle_t *cycle,
     void *data);
 static ngx_cycle_t *ngx_http_dynamic_include_copy_cycle(ngx_cycle_t *cycle,
     ngx_pool_t *pool, ngx_pool_t *temp_pool);
-static ngx_int_t ngx_http_dynamic_include_listen(ngx_cycle_t *cycle,
-    ngx_str_t *file, ngx_array_t *ports);
+static ngx_int_t ngx_http_dynamic_include_names(ngx_cycle_t *cycle,
+    ngx_str_t *file, ngx_array_t *ports, ngx_pool_t *pool,
+    ngx_http_dynamic_file_t *df);
 static ngx_http_addr_conf_t *ngx_http_dynamic_include_addr(ngx_cycle_t *cycle,
     struct sockaddr *sa, socklen_t socklen, int type);
 static ngx_int_t ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
     ngx_http_dynamic_include_t *di, ngx_str_t *file, ngx_pool_t *pool,
-    ngx_array_t **servers);
-static ngx_int_t ngx_http_dynamic_include_load(ngx_cycle_t *cycle,
-    ngx_http_dynamic_include_t *di, ngx_str_t *file,
+    ngx_http_dynamic_file_t *df);
+static ngx_http_dynamic_file_t *ngx_http_dynamic_include_load(
+    ngx_cycle_t *cycle, ngx_http_dynamic_include_t *di, ngx_str_t *file,
     ngx_file_info_t *fi);
+static ngx_int_t ngx_http_dynamic_include_attach(
+    ngx_http_dynamic_include_t *di, ngx_http_dynamic_file_t *df);
+static ngx_http_dynamic_addr_t *ngx_http_dynamic_include_addr_node(
+    ngx_http_dynamic_include_t *di, ngx_http_addr_conf_t *addr_conf);
 static void ngx_http_dynamic_include_detach(
     ngx_http_dynamic_include_t *di, ngx_http_dynamic_file_t *df);
-static void ngx_http_dynamic_include_release(
-    ngx_http_dynamic_include_t *di, ngx_http_dynamic_file_t *df);
+static void ngx_http_dynamic_include_release(ngx_http_dynamic_file_t *df);
+static void ngx_http_dynamic_include_cleanup(void *data);
 
 
 static ngx_command_t  ngx_http_dynamic_include_commands[] = {
@@ -291,6 +327,7 @@ ngx_http_dynamic_include_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ngx_rbtree_init(&di->sh->rbtree, &di->sh->sentinel,
                     ngx_str_rbtree_insert_value);
     ngx_queue_init(&di->sh->queue);
+    ngx_queue_init(&di->sh->addrs);
 
     di->sh->rwlock = 0;
     di->sh->generation = 0;
@@ -305,13 +342,20 @@ ngx_http_dynamic_include_reload(ngx_cycle_t *cycle, void *data)
     ngx_http_dynamic_include_t *di = data;
 
     ngx_str_t                   file;
-    ngx_int_t                   rc;
+    ngx_int_t                   rc, rc2;
     ngx_err_t                   err;
     ngx_glob_t                  gl;
     ngx_queue_t                *q, *next;
     ngx_uint_t                  generation;
     ngx_file_info_t             fi;
-    ngx_http_dynamic_file_t    *df;
+    ngx_http_dynamic_file_t    *df, *ndf;
+
+    /*
+     * The master process is the only one that changes the zone, so it reads
+     * it without a lock and takes the write lock only around the changes.
+     * A file is parsed outside of the lock, which keeps the workers from
+     * waiting for it.
+     */
 
     rc = NGX_OK;
 
@@ -326,8 +370,6 @@ ngx_http_dynamic_include_reload(ngx_cycle_t *cycle, void *data)
                       ngx_open_glob_n " \"%s\" failed", gl.pattern);
         return NGX_ERROR;
     }
-
-    ngx_rwlock_wlock(&di->sh->rwlock);
 
     generation = ++di->sh->generation;
 
@@ -359,19 +401,48 @@ ngx_http_dynamic_include_reload(ngx_cycle_t *cycle, void *data)
             ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
                           "reloading dynamic configuration \"%V\"", &file);
 
-            ngx_http_dynamic_include_detach(di, df);
-
         } else {
             ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
                           "loading dynamic configuration \"%V\"", &file);
         }
 
-        if (ngx_http_dynamic_include_load(cycle, di, &file, &fi) != NGX_OK) {
+        ndf = ngx_http_dynamic_include_load(cycle, di, &file, &fi);
+
+        if (ndf == NULL) {
+            rc = NGX_ERROR;
+
+            if (df) {
+                /* the version loaded earlier stays in place */
+                df->generation = generation;
+            }
+
+            continue;
+        }
+
+        ndf->generation = generation;
+
+        ngx_rwlock_wlock(&di->sh->rwlock);
+
+        if (df) {
+            ngx_http_dynamic_include_detach(di, df);
+        }
+
+        rc2 = ngx_http_dynamic_include_attach(di, ndf);
+
+        ngx_rwlock_unlock(&di->sh->rwlock);
+
+        if (rc2 != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                          "no memory in zone \"%V\" to load \"%V\"",
+                          &di->shm_zone->shm.name, &file);
+            ngx_destroy_pool(ndf->pool);
             rc = NGX_ERROR;
         }
     }
 
     /* servers whose files are gone are removed from the zone */
+
+    ngx_rwlock_wlock(&di->sh->rwlock);
 
     for (q = ngx_queue_head(&di->sh->queue);
          q != ngx_queue_sentinel(&di->sh->queue);
@@ -403,13 +474,12 @@ ngx_http_dynamic_include_reload(ngx_cycle_t *cycle, void *data)
 }
 
 
-static ngx_int_t
+static ngx_http_dynamic_file_t *
 ngx_http_dynamic_include_load(ngx_cycle_t *cycle,
     ngx_http_dynamic_include_t *di, ngx_str_t *file,
     ngx_file_info_t *fi)
 {
     ngx_pool_t               *pool;
-    ngx_array_t              *servers;
     ngx_http_dynamic_file_t  *df;
 
     /*
@@ -424,13 +494,13 @@ ngx_http_dynamic_include_load(ngx_cycle_t *cycle,
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                       "no memory in zone \"%V\" to load \"%V\"",
                       &di->shm_zone->shm.name, file);
-        return NGX_ERROR;
+        return NULL;
     }
 
     df = ngx_pcalloc(pool, sizeof(ngx_http_dynamic_file_t) + file->len + 1);
     if (df == NULL) {
         ngx_destroy_pool(pool);
-        return NGX_ERROR;
+        return NULL;
     }
 
     df->sn.str.data = (u_char *) df + sizeof(ngx_http_dynamic_file_t);
@@ -438,6 +508,13 @@ ngx_http_dynamic_include_load(ngx_cycle_t *cycle,
     ngx_memcpy(df->sn.str.data, file->data, file->len);
 
     df->sn.node.key = ngx_crc32_long(df->sn.str.data, df->sn.str.len);
+
+    df->pool = pool;
+    df->refs = 1;
+    df->ino = ngx_file_uniq(fi);
+    df->mtime = ngx_file_mtime(fi);
+
+    ngx_queue_init(&df->names);
 
     /*
      * The name is parsed from the copy of it this file keeps, so that what
@@ -447,24 +524,14 @@ ngx_http_dynamic_include_load(ngx_cycle_t *cycle,
      * the next name read replaces.
      */
 
-    if (ngx_http_dynamic_include_parse(cycle, di, &df->sn.str, pool, &servers)
+    if (ngx_http_dynamic_include_parse(cycle, di, &df->sn.str, pool, df)
         != NGX_OK)
     {
         ngx_destroy_pool(pool);
-        return NGX_ERROR;
+        return NULL;
     }
 
-    df->pool = pool;
-    df->refs = 1;
-    df->generation = di->sh->generation;
-    df->ino = ngx_file_uniq(fi);
-    df->mtime = ngx_file_mtime(fi);
-    df->servers = servers;
-
-    ngx_rbtree_insert(&di->sh->rbtree, &df->sn.node);
-    ngx_queue_insert_tail(&di->sh->queue, &df->queue);
-
-    return NGX_OK;
+    return df;
 }
 
 
@@ -479,7 +546,7 @@ ngx_http_dynamic_include_load(ngx_cycle_t *cycle,
 static ngx_int_t
 ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
     ngx_http_dynamic_include_t *di, ngx_str_t *file, ngx_pool_t *pool,
-    ngx_array_t **servers)
+    ngx_http_dynamic_file_t *df)
 {
     void                       **main_conf;
     ngx_uint_t                   m, mi, s;
@@ -632,10 +699,6 @@ ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
         }
     }
 
-    if (ngx_http_dynamic_include_listen(cycle, file, dcmcf->ports) != NGX_OK) {
-        goto failed;
-    }
-
     /* merge the servers with the static http{} level */
 
     for (m = 0; cycle->modules[m]; m++) {
@@ -652,6 +715,17 @@ ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
         {
             goto failed;
         }
+    }
+
+    /*
+     * The server names are known once the servers are merged, an unnamed
+     * server having been given an empty name by then.
+     */
+
+    if (ngx_http_dynamic_include_names(cycle, file, dcmcf->ports, pool, df)
+        != NGX_OK)
+    {
+        goto failed;
     }
 
     for (s = 0; s < dcmcf->servers.nelts; s++) {
@@ -678,7 +752,7 @@ ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
 
     ngx_destroy_pool(temp_pool);
 
-    *servers = &dcmcf->servers;
+    df->servers = &dcmcf->servers;
 
     return NGX_OK;
 
@@ -747,22 +821,29 @@ ngx_http_dynamic_include_copy_cycle(ngx_cycle_t *cycle, ngx_pool_t *pool,
 
 
 /*
- * A dynamic configuration cannot create a listening socket, so every address
- * a dynamic server listens on has to be one the static configuration already
- * listens on.  The match is exact: a wildcard address in the static
- * configuration does not admit a specific address here, because narrowing a
- * wildcard is not something a dynamic server can express.
+ * Indexes the servers of a file by the address they listen on and their
+ * name.  A dynamic configuration cannot create a listening socket, so every
+ * address has to be one the static configuration already listens on.  The
+ * match is exact: a wildcard address in the static configuration does not
+ * admit a specific address here, because narrowing a wildcard is not
+ * something a dynamic server can express.
+ *
+ * The entries are only linked into the file here; they enter the zone once
+ * the file is attached to it.
  */
 
 static ngx_int_t
-ngx_http_dynamic_include_listen(ngx_cycle_t *cycle, ngx_str_t *file,
-    ngx_array_t *ports)
+ngx_http_dynamic_include_names(ngx_cycle_t *cycle, ngx_str_t *file,
+    ngx_array_t *ports, ngx_pool_t *pool, ngx_http_dynamic_file_t *df)
 {
-    char                  *name;
-    ngx_uint_t             p, a;
-    ngx_http_conf_port_t  *port;
-    ngx_http_conf_addr_t  *addr;
-    ngx_http_addr_conf_t  *addr_conf;
+    char                       *name;
+    ngx_uint_t                  p, a, s, n;
+    ngx_http_conf_port_t       *port;
+    ngx_http_conf_addr_t       *addr;
+    ngx_http_addr_conf_t       *addr_conf;
+    ngx_http_server_name_t     *sn;
+    ngx_http_dynamic_name_t    *dn;
+    ngx_http_core_srv_conf_t  **cscfp;
 
     port = ports->elts;
 
@@ -812,7 +893,42 @@ ngx_http_dynamic_include_listen(ngx_cycle_t *cycle, ngx_str_t *file,
                               &addr[a].opt.addr_text, file, name);
                 return NGX_ERROR;
             }
+
+            cscfp = addr[a].servers.elts;
+
+            for (s = 0; s < addr[a].servers.nelts; s++) {
+
+                sn = cscfp[s]->server_names.elts;
+
+                for (n = 0; n < cscfp[s]->server_names.nelts; n++) {
+
+                    if (sn[n].name.len == 0) {
+                        continue;
+                    }
+
+                    dn = ngx_palloc(pool, sizeof(ngx_http_dynamic_name_t));
+                    if (dn == NULL) {
+                        return NGX_ERROR;
+                    }
+
+                    dn->sn.str = sn[n].name;
+                    dn->sn.node.key = ngx_crc32_long(sn[n].name.data,
+                                                     sn[n].name.len);
+                    dn->addr_conf = addr_conf;
+                    dn->addr = NULL;
+                    dn->cscf = cscfp[s];
+                    dn->file = df;
+
+                    ngx_queue_insert_tail(&df->names, &dn->queue);
+                }
+            }
         }
+    }
+
+    if (ngx_queue_empty(&df->names)) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "no \"server_name\" in \"%V\"", file);
+        return NGX_ERROR;
     }
 
     return NGX_OK;
@@ -904,7 +1020,94 @@ ngx_http_dynamic_include_addr(ngx_cycle_t *cycle, struct sockaddr *sa,
 
 
 /*
- * Removes a server from the zone.  Its memory is released once the last
+ * Adds a file to the zone, making its servers available to the workers.
+ * The zone must be write locked.
+ */
+
+static ngx_int_t
+ngx_http_dynamic_include_attach(ngx_http_dynamic_include_t *di,
+    ngx_http_dynamic_file_t *df)
+{
+    ngx_queue_t              *q;
+    ngx_http_dynamic_addr_t  *da;
+    ngx_http_dynamic_name_t  *dn;
+
+    /*
+     * The address of every name is resolved before anything is inserted, so
+     * that running out of memory here leaves the zone as it was.
+     */
+
+    for (q = ngx_queue_head(&df->names);
+         q != ngx_queue_sentinel(&df->names);
+         q = ngx_queue_next(q))
+    {
+        dn = ngx_queue_data(q, ngx_http_dynamic_name_t, queue);
+
+        da = ngx_http_dynamic_include_addr_node(di, dn->addr_conf);
+        if (da == NULL) {
+            return NGX_ERROR;
+        }
+
+        dn->addr = da;
+    }
+
+    for (q = ngx_queue_head(&df->names);
+         q != ngx_queue_sentinel(&df->names);
+         q = ngx_queue_next(q))
+    {
+        dn = ngx_queue_data(q, ngx_http_dynamic_name_t, queue);
+
+        ngx_rbtree_insert(&dn->addr->names, &dn->sn.node);
+    }
+
+    ngx_rbtree_insert(&di->sh->rbtree, &df->sn.node);
+    ngx_queue_insert_tail(&di->sh->queue, &df->queue);
+
+    return NGX_OK;
+}
+
+
+/*
+ * The names of one address of the static configuration.  Once created, it
+ * lives as long as the zone: there are only as many of these as there are
+ * addresses, and an empty one is reused by the next file.
+ */
+
+static ngx_http_dynamic_addr_t *
+ngx_http_dynamic_include_addr_node(ngx_http_dynamic_include_t *di,
+    ngx_http_addr_conf_t *addr_conf)
+{
+    ngx_queue_t              *q;
+    ngx_http_dynamic_addr_t  *da;
+
+    for (q = ngx_queue_head(&di->sh->addrs);
+         q != ngx_queue_sentinel(&di->sh->addrs);
+         q = ngx_queue_next(q))
+    {
+        da = ngx_queue_data(q, ngx_http_dynamic_addr_t, queue);
+
+        if (da->addr_conf == addr_conf) {
+            return da;
+        }
+    }
+
+    da = ngx_slab_alloc(di->shpool, sizeof(ngx_http_dynamic_addr_t));
+    if (da == NULL) {
+        return NULL;
+    }
+
+    da->addr_conf = addr_conf;
+
+    ngx_rbtree_init(&da->names, &da->sentinel, ngx_str_rbtree_insert_value);
+
+    ngx_queue_insert_tail(&di->sh->addrs, &da->queue);
+
+    return da;
+}
+
+
+/*
+ * Removes a file from the zone.  Its memory is released once the last
  * request referencing it is done.  The zone must be write locked.
  */
 
@@ -912,20 +1115,135 @@ static void
 ngx_http_dynamic_include_detach(ngx_http_dynamic_include_t *di,
     ngx_http_dynamic_file_t *df)
 {
+    ngx_queue_t              *q;
+    ngx_http_dynamic_name_t  *dn;
+
+    for (q = ngx_queue_head(&df->names);
+         q != ngx_queue_sentinel(&df->names);
+         q = ngx_queue_next(q))
+    {
+        dn = ngx_queue_data(q, ngx_http_dynamic_name_t, queue);
+
+        ngx_rbtree_delete(&dn->addr->names, &dn->sn.node);
+        dn->addr = NULL;
+    }
+
     ngx_rbtree_delete(&di->sh->rbtree, &df->sn.node);
     ngx_queue_remove(&df->queue);
 
-    ngx_http_dynamic_include_release(di, df);
+    ngx_http_dynamic_include_release(df);
 }
 
 
 static void
-ngx_http_dynamic_include_release(ngx_http_dynamic_include_t *di,
-    ngx_http_dynamic_file_t *df)
+ngx_http_dynamic_include_release(ngx_http_dynamic_file_t *df)
 {
     if (ngx_atomic_fetch_add(&df->refs, -1) != 1) {
         return;
     }
 
     ngx_destroy_pool(df->pool);
+}
+
+
+static void
+ngx_http_dynamic_include_cleanup(void *data)
+{
+    ngx_http_dynamic_include_release(data);
+}
+
+
+/*
+ * Looks for a server with the given name among those loaded for the address
+ * the request arrived on.  The parts are searched in the order of their
+ * appearance in the configuration, so that the first match wins.
+ *
+ * A reference to the file the server was found in is held until the request
+ * is done, which keeps its configuration from being released under it.
+ */
+
+ngx_int_t
+ngx_http_dynamic_include_find(ngx_http_request_t *r, ngx_str_t *host,
+    ngx_http_core_srv_conf_t **cscfp)
+{
+    uint32_t                               hash;
+    ngx_uint_t                             i;
+    ngx_queue_t                           *q;
+    ngx_pool_cleanup_t                    *cln;
+    ngx_http_addr_conf_t                  *addr_conf;
+    ngx_http_dynamic_addr_t               *da;
+    ngx_http_dynamic_file_t               *df;
+    ngx_http_dynamic_name_t               *dn;
+    ngx_http_core_srv_conf_t              *cscf;
+    ngx_http_dynamic_include_t            *di, **dip;
+    ngx_http_dynamic_include_main_conf_t  *dimcf;
+
+    if (host->len == 0) {
+        return NGX_DECLINED;
+    }
+
+    dimcf = ngx_http_get_module_main_conf(r, ngx_http_dynamic_include_module);
+
+    addr_conf = r->http_connection->addr_conf;
+
+    hash = ngx_crc32_long(host->data, host->len);
+
+    dip = dimcf->parts.elts;
+
+    for (i = 0; i < dimcf->parts.nelts; i++) {
+        di = dip[i];
+
+        cscf = NULL;
+        df = NULL;
+
+        ngx_rwlock_rlock(&di->sh->rwlock);
+
+        for (q = ngx_queue_head(&di->sh->addrs);
+             q != ngx_queue_sentinel(&di->sh->addrs);
+             q = ngx_queue_next(q))
+        {
+            da = ngx_queue_data(q, ngx_http_dynamic_addr_t, queue);
+
+            if (da->addr_conf != addr_conf) {
+                continue;
+            }
+
+            dn = (ngx_http_dynamic_name_t *)
+                     ngx_str_rbtree_lookup(&da->names, host, hash);
+
+            if (dn) {
+                cscf = dn->cscf;
+                df = dn->file;
+
+                (void) ngx_atomic_fetch_add(&df->refs, 1);
+            }
+
+            break;
+        }
+
+        ngx_rwlock_unlock(&di->sh->rwlock);
+
+        if (cscf == NULL) {
+            continue;
+        }
+
+        cln = ngx_pool_cleanup_add(r->pool, 0);
+        if (cln == NULL) {
+            ngx_http_dynamic_include_release(df);
+            return NGX_ERROR;
+        }
+
+        cln->handler = ngx_http_dynamic_include_cleanup;
+        cln->data = df;
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "dynamic server \"%V\" in \"%V\"",
+                       host, &df->sn.str);
+
+        *cscfp = cscf;
+
+        return NGX_OK;
+    }
+
+    return NGX_DECLINED;
 }

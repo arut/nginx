@@ -2474,10 +2474,13 @@ ngx_http_validate_host(ngx_str_t *host, in_port_t *portp, ngx_pool_t *pool,
 ngx_int_t
 ngx_http_set_virtual_server(ngx_http_request_t *r, ngx_str_t *host)
 {
-    ngx_int_t                  rc;
-    ngx_http_connection_t     *hc;
-    ngx_http_core_loc_conf_t  *clcf;
-    ngx_http_core_srv_conf_t  *cscf;
+    ngx_int_t                   rc;
+    ngx_uint_t                  n;
+    ngx_http_connection_t      *hc;
+    ngx_http_core_loc_conf_t   *clcf;
+    ngx_http_core_srv_conf_t   *cscf;
+    ngx_http_core_main_conf_t  *cmcf;
+    ngx_http_variable_value_t  *variables;
 
 #if (NGX_SUPPRESS_WARN)
     cscf = NULL;
@@ -2511,6 +2514,11 @@ ngx_http_set_virtual_server(ngx_http_request_t *r, ngx_str_t *host)
                                       hc->addr_conf->virtual_names,
                                       host, r, &cscf);
 
+    if (rc == NGX_DECLINED) {
+        /* the static configuration wins over a dynamic one */
+        rc = ngx_http_dynamic_include_find(r, host, &cscf);
+    }
+
     if (rc == NGX_ERROR) {
         ngx_http_close_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return NGX_ERROR;
@@ -2543,8 +2551,46 @@ ngx_http_set_virtual_server(ngx_http_request_t *r, ngx_str_t *host)
         return NGX_OK;
     }
 
+    /*
+     * A dynamic server has a main configuration of its own, which is where
+     * what its file keeps at that level is found.  A static one shares the
+     * one already in use, so that this changes nothing for it.  Nothing has
+     * been read from it at this point but what the two have in common.
+     */
+
+    cmcf = ngx_http_get_module_main_conf(r, ngx_http_core_module);
+    n = cmcf->variables.nelts;
+
+    r->main_conf = cscf->ctx->main_conf;
     r->srv_conf = cscf->ctx->srv_conf;
     r->loc_conf = cscf->ctx->loc_conf;
+
+    cmcf = ngx_http_get_module_main_conf(r, ngx_http_core_module);
+
+    /*
+     * The variables of a dynamic server are those of the static
+     * configuration, at the same indexes, and the ones its file adds after
+     * them, so the values this request holds have to make room for the
+     * latter.  The ones already set are kept.
+     */
+
+    if (cmcf->variables.nelts > n) {
+        variables = ngx_pcalloc(r->pool, cmcf->variables.nelts
+                                         * sizeof(ngx_http_variable_value_t));
+        if (variables == NULL) {
+            ngx_http_close_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return NGX_ERROR;
+        }
+
+        ngx_memcpy(variables, r->variables,
+                   n * sizeof(ngx_http_variable_value_t));
+
+        r->variables = variables;
+    }
+
+    /* a regular expression of the file may have more captures */
+
+    r->realloc_captures = 1;
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 

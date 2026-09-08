@@ -89,6 +89,9 @@ ngx_int_t ngx_http_init_locations(ngx_conf_t *cf,
 ngx_int_t ngx_http_init_static_location_trees(ngx_conf_t *cf,
     ngx_http_core_loc_conf_t *pclcf);
 
+ngx_int_t ngx_http_dynamic_include_find(ngx_http_request_t *r,
+    ngx_str_t *host, ngx_http_core_srv_conf_t **cscfp);
+
 ngx_int_t ngx_http_add_location(ngx_conf_t *cf, ngx_queue_t **locations,
     ngx_http_core_loc_conf_t *clcf);
 ngx_int_t ngx_http_add_listen(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
