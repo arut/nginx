@@ -82,6 +82,13 @@ typedef struct {
 #define ngx_http_set_ctx(r, c, module)      r->ctx[module.ctx_index] = c;
 
 
+char *ngx_http_merge_servers(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf,
+    ngx_module_t *mod);
+ngx_int_t ngx_http_init_locations(ngx_conf_t *cf,
+    ngx_http_core_srv_conf_t *cscf, ngx_http_core_loc_conf_t *pclcf);
+ngx_int_t ngx_http_init_static_location_trees(ngx_conf_t *cf,
+    ngx_http_core_loc_conf_t *pclcf);
+
 ngx_int_t ngx_http_add_location(ngx_conf_t *cf, ngx_queue_t **locations,
     ngx_http_core_loc_conf_t *clcf);
 ngx_int_t ngx_http_add_listen(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,

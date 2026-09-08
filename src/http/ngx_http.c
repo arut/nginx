@@ -27,16 +27,11 @@ static ngx_int_t ngx_http_add_address(ngx_conf_t *cf,
 static ngx_int_t ngx_http_add_server(ngx_conf_t *cf,
     ngx_http_core_srv_conf_t *cscf, ngx_http_conf_addr_t *addr);
 
-static char *ngx_http_merge_servers(ngx_conf_t *cf,
-    ngx_http_core_main_conf_t *cmcf, ngx_http_module_t *module,
-    ngx_uint_t ctx_index);
+static ngx_int_t ngx_http_init_dynamic_conf(ngx_conf_t *cf,
+    ngx_http_conf_ctx_t *ctx);
 static char *ngx_http_merge_locations(ngx_conf_t *cf,
     ngx_queue_t *locations, void **loc_conf, ngx_http_module_t *module,
     ngx_uint_t ctx_index);
-static ngx_int_t ngx_http_init_locations(ngx_conf_t *cf,
-    ngx_http_core_srv_conf_t *cscf, ngx_http_core_loc_conf_t *pclcf);
-static ngx_int_t ngx_http_init_static_location_trees(ngx_conf_t *cf,
-    ngx_http_core_loc_conf_t *pclcf);
 static ngx_int_t ngx_http_escape_location_name(ngx_conf_t *cf,
     ngx_http_core_loc_conf_t *clcf);
 static ngx_int_t ngx_http_cmp_locations(const ngx_queue_t *one,
@@ -268,7 +263,7 @@ ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
         }
 
-        rv = ngx_http_merge_servers(cf, cmcf, module, mi);
+        rv = ngx_http_merge_servers(cf, cmcf, cf->cycle->modules[m]);
         if (rv != NGX_CONF_OK) {
             goto failed;
         }
@@ -312,6 +307,12 @@ ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 return NGX_CONF_ERROR;
             }
         }
+    }
+
+    if (cf->cycle->dynamic.nelts
+        && ngx_http_init_dynamic_conf(cf, ctx) != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
     }
 
     if (ngx_http_variables_init_vars(cf) != NGX_OK) {
@@ -560,10 +561,13 @@ ngx_http_init_phase_handlers(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf)
 }
 
 
-static char *
+char *
 ngx_http_merge_servers(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf,
-    ngx_http_module_t *module, ngx_uint_t ctx_index)
+    ngx_module_t *mod)
 {
+    ngx_http_module_t           *module = mod->ctx;
+    ngx_uint_t                   ctx_index = mod->ctx_index;
+
     char                        *rv;
     ngx_uint_t                   s;
     ngx_http_conf_ctx_t         *ctx, saved;
@@ -581,7 +585,9 @@ ngx_http_merge_servers(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf,
 
         ctx->srv_conf = cscfp[s]->ctx->srv_conf;
 
-        if (module->merge_srv_conf) {
+        if (module->merge_srv_conf
+            && (!cf->dynamic || ngx_module_dynconf(mod, cf->dynamic)))
+        {
             rv = module->merge_srv_conf(cf, saved.srv_conf[ctx_index],
                                         cscfp[s]->ctx->srv_conf[ctx_index]);
             if (rv != NGX_CONF_OK) {
@@ -589,7 +595,9 @@ ngx_http_merge_servers(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf,
             }
         }
 
-        if (module->merge_loc_conf) {
+        if (module->merge_loc_conf
+            && (!cf->dynamic || ngx_module_dynconf(mod, cf->dynamic)))
+        {
 
             /* merge the server{}'s loc_conf */
 
@@ -619,6 +627,55 @@ failed:
     *ctx = saved;
 
     return rv;
+}
+
+
+/*
+ * A dynamic server starts from the configuration of the http{} level: it
+ * inherits the configuration of the modules it may not configure, and
+ * merges its own with that of the ones it may.  Until now that
+ * configuration was only ever used as a merge parent, so it still holds
+ * the unset placeholders a merge turns into defaults, and whatever a merge
+ * creates on demand there, a temporary path or a types hash, is missing.
+ *
+ * Merging it with itself turns it into what a server with no directives at
+ * all would get, which is what a dynamic server needs to start from.  In
+ * particular, nothing has to be created in the pool of a dynamic server
+ * that outlives it.
+ */
+
+static ngx_int_t
+ngx_http_init_dynamic_conf(ngx_conf_t *cf, ngx_http_conf_ctx_t *ctx)
+{
+    ngx_uint_t          m, mi;
+    ngx_http_module_t  *module;
+
+    for (m = 0; cf->cycle->modules[m]; m++) {
+        if (cf->cycle->modules[m]->type != NGX_HTTP_MODULE) {
+            continue;
+        }
+
+        module = cf->cycle->modules[m]->ctx;
+        mi = cf->cycle->modules[m]->ctx_index;
+
+        if (module->merge_srv_conf
+            && module->merge_srv_conf(cf, ctx->srv_conf[mi],
+                                      ctx->srv_conf[mi])
+               != NGX_CONF_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        if (module->merge_loc_conf
+            && module->merge_loc_conf(cf, ctx->loc_conf[mi],
+                                      ctx->loc_conf[mi])
+               != NGX_CONF_OK)
+        {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
 }
 
 
@@ -667,7 +724,7 @@ ngx_http_merge_locations(ngx_conf_t *cf, ngx_queue_t *locations,
 }
 
 
-static ngx_int_t
+ngx_int_t
 ngx_http_init_locations(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
     ngx_http_core_loc_conf_t *pclcf)
 {
@@ -831,7 +888,7 @@ ngx_http_init_locations(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
 }
 
 
-static ngx_int_t
+ngx_int_t
 ngx_http_init_static_location_trees(ngx_conf_t *cf,
     ngx_http_core_loc_conf_t *pclcf)
 {

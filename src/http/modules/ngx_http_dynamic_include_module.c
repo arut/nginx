@@ -43,6 +43,9 @@ typedef struct {
 
     ino_t                          ino;
     time_t                         mtime;
+
+    /* of ngx_http_core_srv_conf_t *, parsed from this file */
+    ngx_array_t                   *servers;
 } ngx_http_dynamic_file_t;
 
 
@@ -78,6 +81,11 @@ static ngx_int_t ngx_http_dynamic_include_init_zone(ngx_shm_zone_t *shm_zone,
     void *data);
 static ngx_int_t ngx_http_dynamic_include_reload(ngx_cycle_t *cycle,
     void *data);
+static ngx_cycle_t *ngx_http_dynamic_include_copy_cycle(ngx_cycle_t *cycle,
+    ngx_pool_t *pool, ngx_pool_t *temp_pool);
+static ngx_int_t ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
+    ngx_http_dynamic_include_t *di, ngx_str_t *file, ngx_pool_t *pool,
+    ngx_array_t **servers);
 static ngx_int_t ngx_http_dynamic_include_load(ngx_cycle_t *cycle,
     ngx_http_dynamic_include_t *di, ngx_str_t *file,
     ngx_file_info_t *fi);
@@ -299,7 +307,7 @@ ngx_http_dynamic_include_reload(ngx_cycle_t *cycle, void *data)
     ngx_queue_t                *q, *next;
     ngx_uint_t                  generation;
     ngx_file_info_t             fi;
-    ngx_http_dynamic_file_t  *df;
+    ngx_http_dynamic_file_t    *df;
 
     rc = NGX_OK;
 
@@ -396,13 +404,14 @@ ngx_http_dynamic_include_load(ngx_cycle_t *cycle,
     ngx_http_dynamic_include_t *di, ngx_str_t *file,
     ngx_file_info_t *fi)
 {
-    ngx_pool_t                 *pool;
+    ngx_pool_t               *pool;
+    ngx_array_t              *servers;
     ngx_http_dynamic_file_t  *df;
 
     /*
-     * The whole server configuration, including this node, is allocated
-     * from a pool in the zone, so that releasing the server is a matter
-     * of destroying its pool.
+     * Everything parsed from the file, including this node, is allocated
+     * from a pool in the zone, so that releasing the file is a matter of
+     * destroying its pool.
      */
 
     pool = ngx_create_shared_pool(NGX_DEFAULT_POOL_SIZE, cycle->log,
@@ -414,7 +423,7 @@ ngx_http_dynamic_include_load(ngx_cycle_t *cycle,
         return NGX_ERROR;
     }
 
-    df = ngx_pcalloc(pool, sizeof(ngx_http_dynamic_file_t) + file->len);
+    df = ngx_pcalloc(pool, sizeof(ngx_http_dynamic_file_t) + file->len + 1);
     if (df == NULL) {
         ngx_destroy_pool(pool);
         return NGX_ERROR;
@@ -426,16 +435,305 @@ ngx_http_dynamic_include_load(ngx_cycle_t *cycle,
 
     df->sn.node.key = ngx_crc32_long(df->sn.str.data, df->sn.str.len);
 
+    /*
+     * The name is parsed from the copy of it this file keeps, so that what
+     * the parse leaves pointing at it, the file name a server reports in a
+     * diagnostic among other things, points into the pool of the file.  The
+     * name the caller has is in the memory the directory is read into, which
+     * the next name read replaces.
+     */
+
+    if (ngx_http_dynamic_include_parse(cycle, di, &df->sn.str, pool, &servers)
+        != NGX_OK)
+    {
+        ngx_destroy_pool(pool);
+        return NGX_ERROR;
+    }
+
     df->pool = pool;
     df->refs = 1;
     df->generation = di->sh->generation;
     df->ino = ngx_file_uniq(fi);
     df->mtime = ngx_file_mtime(fi);
+    df->servers = servers;
 
     ngx_rbtree_insert(&di->sh->rbtree, &df->sn.node);
     ngx_queue_insert_tail(&di->sh->queue, &df->queue);
 
     return NGX_OK;
+}
+
+
+/*
+ * Parses one file into the given shared pool.  The file is parsed in the
+ * http{} context of the static configuration, with a copy of the cycle so
+ * that nothing is appended to the lists of the running one, and with the
+ * core main configuration shadowed so that the servers the file defines
+ * are collected here instead of in the static configuration.
+ */
+
+static ngx_int_t
+ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
+    ngx_http_dynamic_include_t *di, ngx_str_t *file, ngx_pool_t *pool,
+    ngx_array_t **servers)
+{
+    void                       **main_conf;
+    ngx_uint_t                   m, mi, s;
+    ngx_conf_t                   cf;
+    ngx_pool_t                  *temp_pool;
+    ngx_cycle_t                 *copy;
+    ngx_http_module_t           *module;
+    ngx_http_conf_ctx_t          ctx, *hctx;
+    ngx_http_core_srv_conf_t   **cscfp;
+    ngx_http_core_loc_conf_t    *clcf;
+    ngx_http_core_main_conf_t   *dcmcf;
+
+    hctx = (ngx_http_conf_ctx_t *) cycle->conf_ctx[ngx_http_module.index];
+    if (hctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    temp_pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, cycle->log);
+    if (temp_pool == NULL) {
+        return NGX_ERROR;
+    }
+
+    copy = ngx_http_dynamic_include_copy_cycle(cycle, pool, temp_pool);
+    if (copy == NULL) {
+        goto failed;
+    }
+
+    /*
+     * A module keeping something at the main level that this file may add
+     * to makes a configuration of its own from that of the static
+     * configuration, which is what cf->ctx holds while it does.  Every
+     * other module shares the one of the static configuration, as it does
+     * at the levels below.
+     */
+
+    main_conf = ngx_palloc(pool, sizeof(void *) * ngx_http_max_module);
+    if (main_conf == NULL) {
+        goto failed;
+    }
+
+    ngx_memcpy(main_conf, hctx->main_conf,
+               sizeof(void *) * ngx_http_max_module);
+
+    ctx.main_conf = hctx->main_conf;
+    ctx.srv_conf = hctx->srv_conf;
+    ctx.loc_conf = hctx->loc_conf;
+
+    ngx_memzero(&cf, sizeof(ngx_conf_t));
+
+    cf.args = ngx_array_create(temp_pool, 10, sizeof(ngx_str_t));
+    if (cf.args == NULL) {
+        goto failed;
+    }
+
+    cf.name = "dynamic";
+    cf.cycle = copy;
+    cf.pool = pool;
+    cf.temp_pool = temp_pool;
+    cf.log = cycle->log;
+    cf.ctx = &ctx;
+    cf.module_type = NGX_HTTP_MODULE;
+    cf.cmd_type = NGX_HTTP_MAIN_CONF;
+    /*
+     * At this level the file has only the main configurations of its own,
+     * so a directive kept at one of the levels below, which here are those
+     * of the static configuration, is refused rather than written there.
+     */
+
+    cf.dynamic = NGX_HTTP_DYN_CONF;
+
+    for (m = 0; cycle->modules[m]; m++) {
+        if (cycle->modules[m]->type != NGX_HTTP_MODULE) {
+            continue;
+        }
+
+        if (!ngx_module_dynconf(cycle->modules[m], NGX_HTTP_DYN_CONF)) {
+            continue;
+        }
+
+        module = cycle->modules[m]->ctx;
+        mi = cycle->modules[m]->ctx_index;
+
+        if (module->create_main_conf == NULL) {
+            continue;
+        }
+
+        main_conf[mi] = module->create_main_conf(&cf);
+        if (main_conf[mi] == NULL) {
+            goto failed;
+        }
+    }
+
+    ctx.main_conf = main_conf;
+
+    if (ngx_conf_parse(&cf, file) != NGX_CONF_OK) {
+        goto failed;
+    }
+
+    /*
+     * Each of those configurations is finished as the one of the static
+     * configuration is once it has been parsed.
+     */
+
+    for (m = 0; cycle->modules[m]; m++) {
+        if (cycle->modules[m]->type != NGX_HTTP_MODULE) {
+            continue;
+        }
+
+        if (!ngx_module_dynconf(cycle->modules[m], NGX_HTTP_DYN_CONF)) {
+            continue;
+        }
+
+        module = cycle->modules[m]->ctx;
+        mi = cycle->modules[m]->ctx_index;
+
+        if (main_conf[mi] == hctx->main_conf[mi]) {
+
+            /*
+             * The module kept the configuration it was given: what this
+             * parse did not create, it does not initialize either, which
+             * would be initializing the static configuration a second
+             * time, into the pool of this file.
+             */
+
+            continue;
+        }
+
+        if (module->init_main_conf
+            && module->init_main_conf(&cf, main_conf[mi]) != NGX_CONF_OK)
+        {
+            goto failed;
+        }
+    }
+
+    dcmcf = main_conf[ngx_http_core_module.ctx_index];
+
+    if (dcmcf->servers.nelts == 0) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "no server defined in \"%V\"", file);
+        goto failed;
+    }
+
+    /* merge the servers with the static http{} level */
+
+    for (m = 0; cycle->modules[m]; m++) {
+        if (cycle->modules[m]->type != NGX_HTTP_MODULE) {
+            continue;
+        }
+
+        if (!ngx_module_dynconf(cycle->modules[m], NGX_HTTP_DYN_CONF)) {
+            continue;
+        }
+
+        if (ngx_http_merge_servers(&cf, dcmcf, cycle->modules[m])
+            != NGX_CONF_OK)
+        {
+            goto failed;
+        }
+    }
+
+    cscfp = dcmcf->servers.elts;
+
+    for (s = 0; s < dcmcf->servers.nelts; s++) {
+
+        if (!cscfp[s]->listen) {
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                          "no \"listen\" in a server defined in \"%V\"", file);
+            goto failed;
+        }
+
+        clcf = cscfp[s]->ctx->loc_conf[ngx_http_core_module.ctx_index];
+
+        if (ngx_http_init_locations(&cf, cscfp[s], clcf) != NGX_OK
+            || ngx_http_init_static_location_trees(&cf, clcf) != NGX_OK)
+        {
+            goto failed;
+        }
+    }
+
+    /*
+     * Last, as ngx_http_block() does it: the handlers of the variables this
+     * file indexed are set, a name it used and nothing defines is reported,
+     * and the hash a request looks a name up in is built.
+     */
+
+    if (ngx_http_variables_init_vars(&cf) != NGX_OK) {
+        goto failed;
+    }
+
+    dcmcf->variables_keys = NULL;
+
+    ngx_destroy_pool(temp_pool);
+
+    *servers = &dcmcf->servers;
+
+    return NGX_OK;
+
+failed:
+
+    ngx_destroy_pool(temp_pool);
+
+    return NGX_ERROR;
+}
+
+
+/*
+ * A copy of the running cycle, used while parsing.  Its lists of shared
+ * memory zones, open files and paths are those of the running cycle, so
+ * that a directive referring to one finds the one the static configuration
+ * declares, which is memory the workers can see because it predates the
+ * fork.  Creating a new one is refused where it happens, which is what
+ * "dynamic_load" marks.
+ *
+ * The lists a parse does append to get a copy of their own: the reload
+ * handlers, so that nothing is registered twice, and the configuration dump,
+ * whose entries live in the pool of this parse.
+ */
+
+static ngx_cycle_t *
+ngx_http_dynamic_include_copy_cycle(ngx_cycle_t *cycle, ngx_pool_t *pool,
+    ngx_pool_t *temp_pool)
+{
+    ngx_cycle_t  *copy;
+
+    copy = ngx_palloc(temp_pool, sizeof(ngx_cycle_t));
+    if (copy == NULL) {
+        return NULL;
+    }
+
+    *copy = *cycle;
+
+    /*
+     * The pool of a cycle is where a name is completed with a prefix, as
+     * ngx_conf_full_name() does it, so it is the pool of the file: what a
+     * directive keeps of such a name is read while a request is served.
+     */
+
+    copy->pool = pool;
+    copy->dynamic_load = 1;
+
+    if (ngx_array_init(&copy->dynamic, temp_pool, 1,
+                       sizeof(ngx_dynamic_conf_t))
+        != NGX_OK)
+    {
+        return NULL;
+    }
+
+    if (ngx_array_init(&copy->config_dump, temp_pool, 1,
+                       sizeof(ngx_conf_dump_t))
+        != NGX_OK)
+    {
+        return NULL;
+    }
+
+    ngx_rbtree_init(&copy->config_dump_rbtree, &copy->config_dump_sentinel,
+                    ngx_str_rbtree_insert_value);
+
+    return copy;
 }
 
 

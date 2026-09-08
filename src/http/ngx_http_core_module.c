@@ -3010,7 +3010,7 @@ ngx_http_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy)
     void                        *mconf;
     size_t                       len;
     u_char                      *p;
-    ngx_uint_t                   i;
+    ngx_uint_t                   i, mi;
     ngx_conf_t                   pcf;
     ngx_http_module_t           *module;
     struct sockaddr_in          *sin;
@@ -3048,22 +3048,46 @@ ngx_http_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy)
 
         module = cf->cycle->modules[i]->ctx;
 
-        if (module->create_srv_conf) {
-            mconf = module->create_srv_conf(cf);
-            if (mconf == NULL) {
-                return NGX_CONF_ERROR;
-            }
+        /*
+         * A module that does not make a configuration of its own at one of
+         * these levels for a dynamic configuration inherits the one of the
+         * enclosing static level there.
+         */
 
-            ctx->srv_conf[cf->cycle->modules[i]->ctx_index] = mconf;
+        mi = cf->cycle->modules[i]->ctx_index;
+
+        if (module->create_srv_conf) {
+
+            if (cf->dynamic
+                && !ngx_module_dynconf(cf->cycle->modules[i], cf->dynamic))
+            {
+                ctx->srv_conf[mi] = http_ctx->srv_conf[mi];
+
+            } else {
+                mconf = module->create_srv_conf(cf);
+                if (mconf == NULL) {
+                    return NGX_CONF_ERROR;
+                }
+
+                ctx->srv_conf[mi] = mconf;
+            }
         }
 
         if (module->create_loc_conf) {
-            mconf = module->create_loc_conf(cf);
-            if (mconf == NULL) {
-                return NGX_CONF_ERROR;
-            }
 
-            ctx->loc_conf[cf->cycle->modules[i]->ctx_index] = mconf;
+            if (cf->dynamic
+                && !ngx_module_dynconf(cf->cycle->modules[i], cf->dynamic))
+            {
+                ctx->loc_conf[mi] = http_ctx->loc_conf[mi];
+
+            } else {
+                mconf = module->create_loc_conf(cf);
+                if (mconf == NULL) {
+                    return NGX_CONF_ERROR;
+                }
+
+                ctx->loc_conf[mi] = mconf;
+            }
         }
     }
 
@@ -3156,7 +3180,7 @@ ngx_http_core_location(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy)
     size_t                     len;
     ngx_str_t                 *value, *name;
     ngx_int_t                  index;
-    ngx_uint_t                 i;
+    ngx_uint_t                 i, mi;
     ngx_conf_t                 save;
     ngx_http_module_t         *module;
     ngx_http_conf_ctx_t       *ctx, *pctx;
@@ -3182,11 +3206,20 @@ ngx_http_core_location(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy)
         }
 
         module = cf->cycle->modules[i]->ctx;
+        mi = cf->cycle->modules[i]->ctx_index;
+
+        /* an ineligible module inherits the enclosing configuration */
+
+        if (cf->dynamic
+            && !ngx_module_dynconf(cf->cycle->modules[i], cf->dynamic))
+        {
+            ctx->loc_conf[mi] = pctx->loc_conf[mi];
+            continue;
+        }
 
         if (module->create_loc_conf) {
-            ctx->loc_conf[cf->cycle->modules[i]->ctx_index] =
-                                                   module->create_loc_conf(cf);
-            if (ctx->loc_conf[cf->cycle->modules[i]->ctx_index] == NULL) {
+            ctx->loc_conf[mi] = module->create_loc_conf(cf);
+            if (ctx->loc_conf[mi] == NULL) {
                 return NGX_CONF_ERROR;
             }
         }
