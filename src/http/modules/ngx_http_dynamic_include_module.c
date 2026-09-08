@@ -83,6 +83,10 @@ static ngx_int_t ngx_http_dynamic_include_reload(ngx_cycle_t *cycle,
     void *data);
 static ngx_cycle_t *ngx_http_dynamic_include_copy_cycle(ngx_cycle_t *cycle,
     ngx_pool_t *pool, ngx_pool_t *temp_pool);
+static ngx_int_t ngx_http_dynamic_include_listen(ngx_cycle_t *cycle,
+    ngx_str_t *file, ngx_array_t *ports);
+static ngx_http_addr_conf_t *ngx_http_dynamic_include_addr(ngx_cycle_t *cycle,
+    struct sockaddr *sa, socklen_t socklen, int type);
 static ngx_int_t ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
     ngx_http_dynamic_include_t *di, ngx_str_t *file, ngx_pool_t *pool,
     ngx_array_t **servers);
@@ -618,6 +622,20 @@ ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
         goto failed;
     }
 
+    cscfp = dcmcf->servers.elts;
+
+    for (s = 0; s < dcmcf->servers.nelts; s++) {
+        if (!cscfp[s]->listen) {
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                          "no \"listen\" in a server defined in \"%V\"", file);
+            goto failed;
+        }
+    }
+
+    if (ngx_http_dynamic_include_listen(cycle, file, dcmcf->ports) != NGX_OK) {
+        goto failed;
+    }
+
     /* merge the servers with the static http{} level */
 
     for (m = 0; cycle->modules[m]; m++) {
@@ -636,16 +654,7 @@ ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
         }
     }
 
-    cscfp = dcmcf->servers.elts;
-
     for (s = 0; s < dcmcf->servers.nelts; s++) {
-
-        if (!cscfp[s]->listen) {
-            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                          "no \"listen\" in a server defined in \"%V\"", file);
-            goto failed;
-        }
-
         clcf = cscfp[s]->ctx->loc_conf[ngx_http_core_module.ctx_index];
 
         if (ngx_http_init_locations(&cf, cscfp[s], clcf) != NGX_OK
@@ -734,6 +743,163 @@ ngx_http_dynamic_include_copy_cycle(ngx_cycle_t *cycle, ngx_pool_t *pool,
                     ngx_str_rbtree_insert_value);
 
     return copy;
+}
+
+
+/*
+ * A dynamic configuration cannot create a listening socket, so every address
+ * a dynamic server listens on has to be one the static configuration already
+ * listens on.  The match is exact: a wildcard address in the static
+ * configuration does not admit a specific address here, because narrowing a
+ * wildcard is not something a dynamic server can express.
+ */
+
+static ngx_int_t
+ngx_http_dynamic_include_listen(ngx_cycle_t *cycle, ngx_str_t *file,
+    ngx_array_t *ports)
+{
+    char                  *name;
+    ngx_uint_t             p, a;
+    ngx_http_conf_port_t  *port;
+    ngx_http_conf_addr_t  *addr;
+    ngx_http_addr_conf_t  *addr_conf;
+
+    port = ports->elts;
+
+    for (p = 0; p < ports->nelts; p++) {
+
+        addr = port[p].addrs.elts;
+
+        for (a = 0; a < port[p].addrs.nelts; a++) {
+
+            addr_conf = ngx_http_dynamic_include_addr(cycle,
+                                                      addr[a].opt.sockaddr,
+                                                      addr[a].opt.socklen,
+                                                      addr[a].opt.type);
+            if (addr_conf == NULL) {
+                ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                              "\"listen %V\" in \"%V\" does not match any "
+                              "address the static configuration listens on",
+                              &addr[a].opt.addr_text, file);
+                return NGX_ERROR;
+            }
+
+            /*
+             * It has to describe the address the way the static
+             * configuration does, so that a dynamic server on an address
+             * that terminates SSL says so.
+             */
+
+            if (addr[a].opt.ssl != addr_conf->ssl) {
+                name = "ssl";
+
+            } else if (addr[a].opt.http2 != addr_conf->http2) {
+                name = "http2";
+
+            } else if (addr[a].opt.proxy_protocol
+                       != addr_conf->proxy_protocol)
+            {
+                name = "proxy_protocol";
+
+            } else {
+                name = NULL;
+            }
+
+            if (name) {
+                ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                              "\"listen %V\" in \"%V\" differs from the "
+                              "static configuration in \"%s\"",
+                              &addr[a].opt.addr_text, file, name);
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+/*
+ * The address configuration the static configuration keeps for an address,
+ * or NULL if it does not listen on it.
+ */
+
+static ngx_http_addr_conf_t *
+ngx_http_dynamic_include_addr(ngx_cycle_t *cycle, struct sockaddr *sa,
+    socklen_t socklen, int type)
+{
+    ngx_uint_t            i, n;
+    ngx_listening_t      *ls;
+    ngx_http_port_t      *hport;
+    ngx_http_in_addr_t   *addr;
+    struct sockaddr_in   *sin;
+#if (NGX_HAVE_INET6)
+    ngx_http_in6_addr_t  *addr6;
+    struct sockaddr_in6  *sin6;
+#endif
+
+    ls = cycle->listening.elts;
+
+    for (i = 0; i < cycle->listening.nelts; i++) {
+
+        if (ls[i].handler != ngx_http_init_connection
+            || ls[i].type != type)
+        {
+            continue;
+        }
+
+        if (ls[i].sockaddr->sa_family != sa->sa_family
+            || ngx_inet_get_port(ls[i].sockaddr) != ngx_inet_get_port(sa))
+        {
+            continue;
+        }
+
+        hport = ls[i].servers;
+
+        switch (sa->sa_family) {
+
+#if (NGX_HAVE_INET6)
+        case AF_INET6:
+            sin6 = (struct sockaddr_in6 *) sa;
+            addr6 = hport->addrs;
+
+            for (n = 0; n < hport->naddrs; n++) {
+                if (ngx_memcmp(&addr6[n].addr6, &sin6->sin6_addr, 16) == 0) {
+                    return &addr6[n].conf;
+                }
+            }
+
+            break;
+#endif
+
+#if (NGX_HAVE_UNIX_DOMAIN)
+        case AF_UNIX:
+            addr = hport->addrs;
+
+            if (ngx_cmp_sockaddr(ls[i].sockaddr, ls[i].socklen, sa, socklen, 1)
+                == NGX_OK)
+            {
+                return &addr[0].conf;
+            }
+
+            break;
+#endif
+
+        default: /* AF_INET */
+            sin = (struct sockaddr_in *) sa;
+            addr = hport->addrs;
+
+            for (n = 0; n < hport->naddrs; n++) {
+                if (addr[n].addr == sin->sin_addr.s_addr) {
+                    return &addr[n].conf;
+                }
+            }
+
+            break;
+        }
+    }
+
+    return NULL;
 }
 
 
