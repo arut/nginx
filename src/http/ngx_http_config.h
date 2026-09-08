@@ -38,6 +38,21 @@ typedef struct {
 
 #define NGX_HTTP_MODULE           0x50545448   /* "HTTP" */
 
+/*
+ * What an http module advertises in its flags: that a dynamic configuration
+ * may make the configurations it keeps, and that its directives are allowed
+ * there.  A module advertising nothing keeps nothing a dynamic configuration
+ * adds to, or keeps it where it cannot: it inherits every level and its
+ * directives are refused.  One directive of an advertising module that
+ * cannot work in such a configuration says so itself, with NGX_STATIC_CONF.
+ *
+ * What a module makes of its own main configuration is its own decision:
+ * create_main_conf() may return the one it is given, and what a parse did
+ * not create it does not initialize.
+ */
+#define NGX_HTTP_DYN_CONF         0x00000001
+
+
 #define NGX_HTTP_MAIN_CONF        0x02000000
 #define NGX_HTTP_SRV_CONF         0x04000000
 #define NGX_HTTP_LOC_CONF         0x08000000

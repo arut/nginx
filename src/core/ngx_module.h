@@ -217,9 +217,21 @@
     NGX_MODULE_SIGNATURE_33 NGX_MODULE_SIGNATURE_34
 
 
-#define NGX_MODULE_V1                                                         \
+/*
+ * A module advertises what it supports of dynamic configuration in its
+ * flags, and a parse of one holds in cf->dynamic what it needs of a module
+ * for its directives to be allowed and its configuration to be made.  What
+ * the bits are is up to the type of module; ngx_http_config.h has those of
+ * an http module.
+ */
+#define ngx_module_dynconf(m, type)  ((m)->flags & (type))
+
+
+#define NGX_MODULE_V1_FLAGS(flags)                                            \
     NGX_MODULE_UNSET_INDEX, NGX_MODULE_UNSET_INDEX,                           \
-    NULL, 0, 0, nginx_version, NGX_MODULE_SIGNATURE
+    NULL, flags, 0, nginx_version, NGX_MODULE_SIGNATURE
+
+#define NGX_MODULE_V1  NGX_MODULE_V1_FLAGS(0)
 
 #define NGX_MODULE_V1_PADDING  0, 0, 0, 0, 0, 0, 0, 0
 
@@ -230,7 +242,7 @@ struct ngx_module_s {
 
     char                 *name;
 
-    ngx_uint_t            spare0;
+    ngx_uint_t            flags;
     ngx_uint_t            spare1;
 
     ngx_uint_t            version;

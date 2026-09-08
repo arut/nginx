@@ -47,6 +47,7 @@
 #define NGX_CONF_2MORE       0x00001000
 
 #define NGX_DIRECT_CONF      0x00010000
+#define NGX_STATIC_CONF      0x00020000
 
 #define NGX_MAIN_CONF        0x01000000
 #define NGX_ANY_CONF         0xFF000000
@@ -126,6 +127,13 @@ struct ngx_conf_s {
     void                 *ctx;
     ngx_uint_t            module_type;
     ngx_uint_t            cmd_type;
+
+    /*
+     * the type of dynamic configuration being parsed, or zero while
+     * parsing the static configuration; only the directives of modules
+     * advertising this type are allowed
+     */
+    ngx_uint_t            dynamic;
 
     ngx_conf_handler_pt   handler;
     void                 *handler_conf;

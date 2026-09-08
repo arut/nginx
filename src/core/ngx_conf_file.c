@@ -399,6 +399,22 @@ ngx_conf_handler(ngx_conf_t *cf, ngx_int_t last)
                 continue;
             }
 
+            /*
+             * is the module, and the directive, eligible for this dynamic
+             * configuration ?
+             */
+
+            if (cf->dynamic
+                && (!ngx_module_dynconf(cf->cycle->modules[i], cf->dynamic)
+                    || (cmd->type & NGX_STATIC_CONF)))
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "directive \"%s\" is not supported "
+                                   "in a dynamic configuration",
+                                   name->data);
+                return NGX_ERROR;
+            }
+
             if (!(cmd->type & NGX_CONF_BLOCK) && last != NGX_OK) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                   "directive \"%s\" is not terminated by \";\"",
