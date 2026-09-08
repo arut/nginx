@@ -63,6 +63,7 @@ static ngx_int_t ngx_control_api_endpoints(ngx_control_request_t *r,
 static ngx_int_t ngx_control_show_processes(ngx_control_request_t *r);
 static ngx_int_t ngx_control_show_version(ngx_control_request_t *r);
 static ngx_int_t ngx_control_reload_config(ngx_control_request_t *r);
+static ngx_int_t ngx_control_reload_dynamic(ngx_control_request_t *r);
 static ngx_int_t ngx_control_print_config(ngx_control_request_t *r);
 static void ngx_control_log_capture(ngx_log_t *log, ngx_uint_t l,
     u_char *buf, size_t len);
@@ -589,7 +590,8 @@ ngx_control_content(ngx_control_request_t *r)
 
     static const char  *root_endpoints[] = { "1" };
     static const char  *api_endpoints[] = { "control", "nginx" };
-    static const char  *control_endpoints[] = { "processes", "config" };
+    static const char  *control_endpoints[] = { "processes", "config",
+                                                "dynamic" };
 
     p = r->path.data;
     len = r->path.len;
@@ -636,7 +638,7 @@ ngx_control_content(ngx_control_request_t *r)
                 return ngx_control_send_response(r, NGX_CTRL_NOT_ALLOWED, NULL);
             }
 
-            return ngx_control_api_endpoints(r, control_endpoints, 2);
+            return ngx_control_api_endpoints(r, control_endpoints, 3);
         }
 
         break;
@@ -652,6 +654,18 @@ ngx_control_content(ngx_control_request_t *r)
             }
 
             return ngx_control_send_response(r, NGX_CTRL_NOT_ALLOWED, NULL);
+        }
+
+        break;
+
+    case 18:
+        if (ngx_strncmp(p, "/1/control/dynamic", len) == 0) {
+            if (r->method != NGX_CTRL_PATCH) {
+                return ngx_control_send_response(r, NGX_CTRL_NOT_ALLOWED,
+                                                 NULL);
+            }
+
+            return ngx_control_reload_dynamic(r);
         }
 
         break;
@@ -981,6 +995,51 @@ ngx_control_reload_config(ngx_control_request_t *r)
         r->reloaded = 1;
         r->pool->log = ngx_cycle->log;
     }
+
+    obj = ngx_control_json_logs(&log_store);
+    if (obj == NULL) {
+        return NGX_ERROR;
+    }
+
+    return ngx_control_send_json(r, status, obj);
+}
+
+
+/*
+ * Reloads the dynamic parts of the configuration.  Unlike a full reload,
+ * this does not create a new cycle and does not respawn worker processes:
+ * the new configuration is published in shared memory and picked up by the
+ * running workers.
+ */
+
+static ngx_int_t
+ngx_control_reload_dynamic(ngx_control_request_t *r)
+{
+    ngx_int_t         status;
+    ngx_log_t         log, *tmp;
+    ngx_array_t       log_store;
+    ngx_data_item_t  *obj;
+
+    status = NGX_CTRL_OK;
+
+    if (ngx_array_init(&log_store, r->pool, 3, sizeof(ngx_str_t)) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(&log, sizeof(ngx_log_t));
+    log.wdata = &log_store;
+    log.writer = ngx_control_log_capture;
+    log.log_level = NGX_LOG_DEBUG;
+
+    tmp = ngx_cycle->log;
+    log.next = tmp;
+    ngx_cycle->log = &log;
+
+    if (ngx_dynamic_reload((ngx_cycle_t *) ngx_cycle) != NGX_OK) {
+        status = NGX_CTRL_UNPROCESSABLE;
+    }
+
+    ngx_cycle->log = tmp;
 
     obj = ngx_control_json_logs(&log_store);
     if (obj == NULL) {

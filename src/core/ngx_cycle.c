@@ -136,6 +136,13 @@ ngx_init_cycle(ngx_cycle_t *old_cycle)
     ngx_memzero(cycle->paths.elts, n * sizeof(ngx_path_t *));
 
 
+    if (ngx_array_init(&cycle->dynamic, pool, 1, sizeof(ngx_dynamic_conf_t))
+        != NGX_OK)
+    {
+        ngx_destroy_pool(pool);
+        return NULL;
+    }
+
     if (ngx_array_init(&cycle->config_dump, pool, 1, sizeof(ngx_conf_dump_t))
         != NGX_OK)
     {
@@ -649,6 +656,25 @@ ngx_init_cycle(ngx_cycle_t *old_cycle)
     if (ngx_init_modules(cycle) != NGX_OK) {
         /* fatal */
         exit(1);
+    }
+
+
+    /*
+     * The dynamic parts of the configuration are skipped while the static
+     * configuration is loaded; only their shared zones are created and
+     * their reload handlers registered.  Load them now.
+     */
+
+    if (!ngx_test_config && ngx_dynamic_reload(cycle) != NGX_OK) {
+
+        if (ngx_is_init_cycle(old_cycle)) {
+            ngx_log_error(NGX_LOG_EMERG, log, 0,
+                          "failed to load dynamic configuration");
+            return NULL;
+        }
+
+        ngx_log_error(NGX_LOG_EMERG, log, 0,
+                      "failed to load dynamic configuration, ignored");
     }
 
 
@@ -1299,6 +1325,53 @@ ngx_reopen_files(ngx_cycle_t *cycle, ngx_uid_t user)
     }
 
     (void) ngx_log_redirect_stderr(cycle);
+}
+
+
+ngx_dynamic_conf_t *
+ngx_dynamic_add(ngx_conf_t *cf, ngx_str_t *name)
+{
+    ngx_dynamic_conf_t  *dyn;
+
+    dyn = ngx_array_push(&cf->cycle->dynamic);
+    if (dyn == NULL) {
+        return NULL;
+    }
+
+    ngx_memzero(dyn, sizeof(ngx_dynamic_conf_t));
+
+    dyn->name = *name;
+
+    return dyn;
+}
+
+
+ngx_int_t
+ngx_dynamic_reload(ngx_cycle_t *cycle)
+{
+    ngx_int_t            rc;
+    ngx_uint_t           i;
+    ngx_dynamic_conf_t  *dyn;
+
+    rc = NGX_OK;
+
+    dyn = cycle->dynamic.elts;
+
+    for (i = 0; i < cycle->dynamic.nelts; i++) {
+
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "reloading dynamic configuration \"%V\"",
+                       &dyn[i].name);
+
+        if (dyn[i].handler(cycle, dyn[i].data) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                          "could not reload dynamic configuration \"%V\"",
+                          &dyn[i].name);
+            rc = NGX_ERROR;
+        }
+    }
+
+    return rc;
 }
 
 
