@@ -31,7 +31,7 @@ typedef struct {
 } ngx_slab_stat_t;
 
 
-typedef struct {
+typedef struct ngx_slab_pool_s {
     ngx_shmtx_sh_t    lock;
 
     size_t            min_size;
