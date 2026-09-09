@@ -39,7 +39,7 @@ static ngx_int_t ngx_http_degradation_init(ngx_conf_t *cf);
 static ngx_command_t  ngx_http_degradation_commands[] = {
 
     { ngx_string("degradation"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_STATIC_CONF|NGX_CONF_TAKE1,
       ngx_http_degradation,
       NGX_HTTP_MAIN_CONF_OFFSET,
       0,
@@ -72,7 +72,7 @@ static ngx_http_module_t  ngx_http_degradation_module_ctx = {
 
 
 ngx_module_t  ngx_http_degradation_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_degradation_module_ctx,      /* module context */
     ngx_http_degradation_commands,         /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -155,6 +155,14 @@ static void *
 ngx_http_degradation_create_main_conf(ngx_conf_t *cf)
 {
     ngx_http_degradation_main_conf_t  *dmcf;
+
+    if (cf->dynamic) {
+
+        /* nothing here is a dynamic configuration's to make */
+
+        return ngx_http_conf_get_module_main_conf(cf,
+                                                  ngx_http_degradation_module);
+    }
 
     dmcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_degradation_main_conf_t));
     if (dmcf == NULL) {

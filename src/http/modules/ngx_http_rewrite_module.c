@@ -118,7 +118,7 @@ static ngx_http_module_t  ngx_http_rewrite_module_ctx = {
 
 
 ngx_module_t  ngx_http_rewrite_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_rewrite_module_ctx,          /* module context */
     ngx_http_rewrite_commands,             /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -536,7 +536,7 @@ ngx_http_rewrite_if(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     void                         *mconf;
     char                         *rv;
     u_char                       *elts;
-    ngx_uint_t                    i;
+    ngx_uint_t                    i, mi;
     ngx_conf_t                    save;
     ngx_http_module_t            *module;
     ngx_http_conf_ctx_t          *ctx, *pctx;
@@ -564,6 +564,16 @@ ngx_http_rewrite_if(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
         module = cf->cycle->modules[i]->ctx;
+        mi = cf->cycle->modules[i]->ctx_index;
+
+        /* an ineligible module inherits the enclosing configuration */
+
+        if (cf->dynamic
+            && !ngx_module_dynconf(cf->cycle->modules[i], cf->dynamic))
+        {
+            ctx->loc_conf[mi] = pctx->loc_conf[mi];
+            continue;
+        }
 
         if (module->create_loc_conf) {
 
@@ -572,7 +582,7 @@ ngx_http_rewrite_if(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 return NGX_CONF_ERROR;
             }
 
-            ctx->loc_conf[cf->cycle->modules[i]->ctx_index] = mconf;
+            ctx->loc_conf[mi] = mconf;
         }
     }
 

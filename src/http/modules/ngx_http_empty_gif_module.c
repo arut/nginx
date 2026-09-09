@@ -91,7 +91,7 @@ static ngx_http_module_t  ngx_http_empty_gif_module_ctx = {
 
 
 ngx_module_t  ngx_http_empty_gif_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_empty_gif_module_ctx, /* module context */
     ngx_http_empty_gif_commands,   /* module directives */
     NGX_HTTP_MODULE,               /* module type */

@@ -89,7 +89,7 @@ static ngx_http_module_t  ngx_http_map_module_ctx = {
 
 
 ngx_module_t  ngx_http_map_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_map_module_ctx,              /* module context */
     ngx_http_map_commands,                 /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -158,11 +158,21 @@ ngx_http_map_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v,
 static void *
 ngx_http_map_create_conf(ngx_conf_t *cf)
 {
-    ngx_http_map_conf_t  *mcf;
+    ngx_http_map_conf_t  *mcf, *prev;
 
     mcf = ngx_palloc(cf->pool, sizeof(ngx_http_map_conf_t));
     if (mcf == NULL) {
         return NULL;
+    }
+
+    if (cf->dynamic) {
+        /* the sizes the static configuration settled, to add to */
+
+        prev = ngx_http_conf_get_module_main_conf(cf, ngx_http_map_module);
+
+        *mcf = *prev;
+
+        return mcf;
     }
 
     mcf->hash_max_size = NGX_CONF_UNSET_UINT;

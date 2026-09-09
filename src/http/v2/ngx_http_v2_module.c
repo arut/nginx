@@ -81,7 +81,7 @@ static ngx_command_t  ngx_http_v2_commands[] = {
       NULL },
 
     { ngx_string("http2_recv_buffer_size"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_STATIC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_size_slot,
       NGX_HTTP_MAIN_CONF_OFFSET,
       offsetof(ngx_http_v2_main_conf_t, recv_buffer_size),
@@ -198,7 +198,7 @@ static ngx_http_module_t  ngx_http_v2_module_ctx = {
 
 
 ngx_module_t  ngx_http_v2_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_v2_module_ctx,               /* module context */
     ngx_http_v2_commands,                  /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -286,6 +286,16 @@ static void *
 ngx_http_v2_create_main_conf(ngx_conf_t *cf)
 {
     ngx_http_v2_main_conf_t  *h2mcf;
+
+    if (cf->dynamic) {
+
+        /*
+         * the receive buffer is a worker's own, allocated from the
+         * configuration a worker was started with
+         */
+
+        return ngx_http_conf_get_module_main_conf(cf, ngx_http_v2_module);
+    }
 
     h2mcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_v2_main_conf_t));
     if (h2mcf == NULL) {

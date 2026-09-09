@@ -168,7 +168,7 @@ static ngx_int_t ngx_http_log_init(ngx_conf_t *cf);
 static ngx_command_t  ngx_http_log_commands[] = {
 
     { ngx_string("log_format"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_2MORE,
+      NGX_HTTP_MAIN_CONF|NGX_STATIC_CONF|NGX_CONF_2MORE,
       ngx_http_log_set_format,
       NGX_HTTP_MAIN_CONF_OFFSET,
       0,
@@ -183,7 +183,8 @@ static ngx_command_t  ngx_http_log_commands[] = {
       NULL },
 
     { ngx_string("open_log_file_cache"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1234,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_TAKE1234,
       ngx_http_log_open_file_cache,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
@@ -209,7 +210,7 @@ static ngx_http_module_t  ngx_http_log_module_ctx = {
 
 
 ngx_module_t  ngx_http_log_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_log_module_ctx,              /* module context */
     ngx_http_log_commands,                 /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -1244,6 +1245,13 @@ ngx_http_log_create_main_conf(ngx_conf_t *cf)
 
     ngx_http_log_fmt_t  *fmt;
 
+    if (cf->dynamic) {
+
+        /* nothing here is a dynamic configuration's to make */
+
+        return ngx_http_conf_get_module_main_conf(cf, ngx_http_log_module);
+    }
+
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_log_main_conf_t));
     if (conf == NULL) {
         return NULL;
@@ -1398,6 +1406,18 @@ ngx_http_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 
     if (ngx_strncmp(value[1].data, "syslog:", 7) == 0) {
+
+        if (cf->dynamic) {
+            /*
+             * A peer keeps the connection of the process that opened it,
+             * which another process could not use.
+             */
+
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "logging to syslog is not supported "
+                               "in a dynamic configuration");
+            return NGX_CONF_ERROR;
+        }
 
         peer = ngx_pcalloc(cf->pool, sizeof(ngx_syslog_peer_t));
         if (peer == NULL) {
@@ -1609,6 +1629,19 @@ process_formats:
             }
 
             return NGX_CONF_OK;
+        }
+
+        if (cf->dynamic) {
+            /*
+             * The buffer belongs to the file, so it is shared by everything
+             * logging to it, and every process writes to it.  One a dynamic
+             * configuration creates would be in the zone.
+             */
+
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "no buffer for access_log \"%V\" is defined "
+                               "by the static configuration", &value[1]);
+            return NGX_CONF_ERROR;
         }
 
         buffer = ngx_pcalloc(cf->pool, sizeof(ngx_http_log_buf_t));

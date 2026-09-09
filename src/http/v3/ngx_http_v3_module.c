@@ -37,42 +37,42 @@ static ngx_command_t  ngx_http_v3_commands[] = {
       NULL },
 
     { ngx_string("http3_max_concurrent_streams"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_STATIC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_http_v3_srv_conf_t, max_concurrent_streams),
       NULL },
 
     { ngx_string("http3_stream_buffer_size"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_STATIC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_size_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_http_v3_srv_conf_t, quic.stream_buffer_size),
       NULL },
 
     { ngx_string("quic_retry"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_STATIC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_http_v3_srv_conf_t, quic.retry),
       NULL },
 
     { ngx_string("quic_gso"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_STATIC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_http_v3_srv_conf_t, quic.gso_enabled),
       NULL },
 
     { ngx_string("quic_host_key"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_STATIC_CONF|NGX_CONF_TAKE1,
       ngx_http_quic_host_key,
       NGX_HTTP_SRV_CONF_OFFSET,
       0,
       NULL },
 
     { ngx_string("quic_active_connection_id_limit"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_STATIC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_http_v3_srv_conf_t, quic.active_connection_id_limit),
@@ -98,7 +98,7 @@ static ngx_http_module_t  ngx_http_v3_module_ctx = {
 
 
 ngx_module_t  ngx_http_v3_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_v3_module_ctx,               /* module context */
     ngx_http_v3_commands,                  /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -249,6 +249,18 @@ ngx_http_v3_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->quic.active_connection_id_limit,
                               prev->quic.active_connection_id_limit,
                               2);
+
+    if (cf->dynamic) {
+
+        /*
+         * What is left configures a connection, which is run with the
+         * configuration of the default server of its address: a dynamic
+         * server is never one, and "http3" and "http3_hq" are all that is
+         * consulted for it, once a request has been routed to it by name.
+         */
+
+        return NGX_CONF_OK;
+    }
 
     if (conf->quic.host_key.len == 0) {
 

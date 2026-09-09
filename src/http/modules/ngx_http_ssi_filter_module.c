@@ -191,7 +191,7 @@ static ngx_http_module_t  ngx_http_ssi_filter_module_ctx = {
 
 
 ngx_module_t  ngx_http_ssi_filter_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_ssi_filter_module_ctx,       /* module context */
     ngx_http_ssi_filter_commands,          /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -2852,6 +2852,14 @@ static void *
 ngx_http_ssi_create_main_conf(ngx_conf_t *cf)
 {
     ngx_http_ssi_main_conf_t  *smcf;
+
+    if (cf->dynamic) {
+
+        /* nothing here is a dynamic configuration's to make */
+
+        return ngx_http_conf_get_module_main_conf(cf,
+                                                  ngx_http_ssi_filter_module);
+    }
 
     smcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_ssi_main_conf_t));
     if (smcf == NULL) {
