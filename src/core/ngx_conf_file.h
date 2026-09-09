@@ -134,6 +134,7 @@ struct ngx_conf_s {
      * advertising this type are allowed
      */
     ngx_uint_t            dynamic;
+    ngx_uint_t            dynamic_init;   /* preparing the http{} level */
 
     ngx_conf_handler_pt   handler;
     void                 *handler_conf;

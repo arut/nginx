@@ -378,21 +378,24 @@ static ngx_command_t  ngx_http_grpc_commands[] = {
 #if (NGX_HTTP_SSL)
 
     { ngx_string("grpc_ssl_session_reuse"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, upstream.ssl_session_reuse),
       NULL },
 
     { ngx_string("grpc_ssl_protocols"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_1MORE,
       ngx_conf_set_bitmask_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, ssl_protocols),
       &ngx_http_grpc_ssl_protocols },
 
     { ngx_string("grpc_ssl_ciphers"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, ssl_ciphers),
@@ -413,63 +416,72 @@ static ngx_command_t  ngx_http_grpc_commands[] = {
       NULL },
 
     { ngx_string("grpc_ssl_verify"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, upstream.ssl_verify),
       NULL },
 
     { ngx_string("grpc_ssl_verify_depth"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, ssl_verify_depth),
       NULL },
 
     { ngx_string("grpc_ssl_trusted_certificate"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, ssl_trusted_certificate),
       NULL },
 
     { ngx_string("grpc_ssl_crl"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, ssl_crl),
       NULL },
 
     { ngx_string("grpc_ssl_certificate"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_TAKE1,
       ngx_http_set_complex_value_zero_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, upstream.ssl_certificate),
       NULL },
 
     { ngx_string("grpc_ssl_certificate_key"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_TAKE1,
       ngx_http_set_complex_value_zero_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, upstream.ssl_certificate_key),
       NULL },
 
     { ngx_string("grpc_ssl_certificate_cache"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE123,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_TAKE123,
       ngx_http_grpc_ssl_certificate_cache,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
 
     { ngx_string("grpc_ssl_password_file"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_TAKE1,
       ngx_http_grpc_ssl_password_file,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
 
     { ngx_string("grpc_ssl_conf_command"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_TAKE2,
       ngx_conf_set_keyval_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, ssl_conf_commands),
@@ -497,7 +509,7 @@ static ngx_http_module_t  ngx_http_grpc_module_ctx = {
 
 
 ngx_module_t  ngx_http_grpc_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_grpc_module_ctx,             /* module context */
     ngx_http_grpc_commands,                /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -4699,7 +4711,16 @@ ngx_http_grpc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_ptr_value(conf->ssl_conf_commands,
                               prev->ssl_conf_commands, NULL);
 
-    if (conf->ssl && ngx_http_grpc_set_ssl(cf, conf) != NGX_OK) {
+    /*
+     * A dynamic configuration cannot create a context: it is not pool
+     * memory, so a worker started before it was created cannot see it.  It
+     * uses the one of the http{} level, which is created here for that.
+     */
+
+    if ((conf->ssl || cf->dynamic_init)
+        && !cf->dynamic
+        && ngx_http_grpc_set_ssl(cf, conf) != NGX_OK)
+    {
         return NGX_CONF_ERROR;
     }
 

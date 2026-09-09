@@ -650,6 +650,8 @@ ngx_http_init_dynamic_conf(ngx_conf_t *cf, ngx_http_conf_ctx_t *ctx)
     ngx_uint_t          m, mi;
     ngx_http_module_t  *module;
 
+    cf->dynamic_init = 1;
+
     for (m = 0; cf->cycle->modules[m]; m++) {
         if (cf->cycle->modules[m]->type != NGX_HTTP_MODULE) {
             continue;
@@ -663,6 +665,7 @@ ngx_http_init_dynamic_conf(ngx_conf_t *cf, ngx_http_conf_ctx_t *ctx)
                                       ctx->srv_conf[mi])
                != NGX_CONF_OK)
         {
+            cf->dynamic_init = 0;
             return NGX_ERROR;
         }
 
@@ -671,9 +674,12 @@ ngx_http_init_dynamic_conf(ngx_conf_t *cf, ngx_http_conf_ctx_t *ctx)
                                       ctx->loc_conf[mi])
                != NGX_CONF_OK)
         {
+            cf->dynamic_init = 0;
             return NGX_ERROR;
         }
     }
+
+    cf->dynamic_init = 0;
 
     return NGX_OK;
 }

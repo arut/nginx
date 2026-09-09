@@ -6849,6 +6849,19 @@ ngx_http_upstream_add(ngx_conf_t *cf, ngx_url_t *u, ngx_uint_t flags)
         return uscfp[i];
     }
 
+    if (cf->dynamic) {
+        /*
+         * An upstream created here would be added to the static
+         * configuration, which the workers cannot see, and would never be
+         * initialized.
+         */
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "upstream \"%V\" is not defined "
+                           "in the static configuration", &u->host);
+        return NULL;
+    }
+
     uscf = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_srv_conf_t));
     if (uscf == NULL) {
         return NULL;
