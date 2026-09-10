@@ -2626,7 +2626,15 @@ ngx_http_regex_compile(ngx_conf_t *cf, ngx_regex_compile_t *rc)
     re->name = rc->pattern;
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-    cmcf->ncaptures = ngx_max(cmcf->ncaptures, re->ncaptures);
+    /*
+     * What a request allocates for the captures is counted here rather than
+     * rounded once afterwards, so that a configuration made from another
+     * one counts its own patterns while keeping whatever that one already
+     * accounted for: a variable it defines may be one this configuration
+     * only refers to.
+     */
+
+    cmcf->ncaptures = ngx_max(cmcf->ncaptures, (re->ncaptures + 1) * 3);
 
     n = (ngx_uint_t) rc->named_captures;
 
@@ -2751,7 +2759,13 @@ ngx_http_variables_add_core_vars(ngx_conf_t *cf)
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
-    cmcf->variables_keys = ngx_pcalloc(cf->temp_pool,
+    /*
+     * The keys are what a dynamic configuration resolves a name against,
+     * so they outlive the parse of the static configuration: the arrays
+     * below are in cf->pool already, and this holds them.
+     */
+
+    cmcf->variables_keys = ngx_pcalloc(cf->pool,
                                        sizeof(ngx_hash_keys_arrays_t));
     if (cmcf->variables_keys == NULL) {
         return NGX_ERROR;
@@ -2865,6 +2879,22 @@ ngx_http_variables_init_vars(ngx_conf_t *cf)
     }
 
 
+    if (cf->dynamic) {
+
+        /*
+         * The hash is what a name is looked up in while a request is served,
+         * which only ngx_http_get_variable() does, for the few directives
+         * naming a variable at that point rather than at configuration
+         * time.  It would be the largest thing a dynamic configuration
+         * keeps, most of it a copy of what the static configuration already
+         * has, so it keeps none: the hash it inherits resolves every name
+         * the static configuration defines, and a name only its own file
+         * defines is not found there.
+         */
+
+        return NGX_OK;
+    }
+
     for (n = 0; n < cmcf->variables_keys->keys.nelts; n++) {
         av = key[n].value;
 
@@ -2888,8 +2918,6 @@ ngx_http_variables_init_vars(ngx_conf_t *cf)
     {
         return NGX_ERROR;
     }
-
-    cmcf->variables_keys = NULL;
 
     return NGX_OK;
 }

@@ -750,7 +750,8 @@ static ngx_command_t  ngx_http_core_commands[] = {
       NULL },
 
     { ngx_string("resolver"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_STATIC_CONF
+                        |NGX_CONF_1MORE,
       ngx_http_core_resolver,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
@@ -826,7 +827,7 @@ static ngx_http_module_t  ngx_http_core_module_ctx = {
 
 
 ngx_module_t  ngx_http_core_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_core_module_ctx,             /* module context */
     ngx_http_core_commands,                /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -3541,11 +3542,124 @@ ngx_http_core_postconfiguration(ngx_conf_t *cf)
 static void *
 ngx_http_core_create_main_conf(ngx_conf_t *cf)
 {
-    ngx_http_core_main_conf_t  *cmcf;
+    ngx_uint_t                  i;
+    ngx_hash_key_t             *key;
+    ngx_http_variable_t        *av, *v;
+    ngx_http_core_main_conf_t  *cmcf, *prev;
 
     cmcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_core_main_conf_t));
     if (cmcf == NULL) {
         return NULL;
+    }
+
+    if (cf->dynamic) {
+
+        /*
+         * Made from the one of the static configuration: the servers are
+         * what a dynamic configuration adds to here, so it holds a list of
+         * its own and ngx_http_core_server() collects the servers a file
+         * defines there rather than in the static configuration.
+         */
+
+        prev = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+
+        *cmcf = *prev;
+
+        cmcf->ports = NULL;
+
+        if (ngx_array_init(&cmcf->servers, cf->pool, 1,
+                           sizeof(ngx_http_core_srv_conf_t *))
+            != NGX_OK)
+        {
+            return NULL;
+        }
+
+        /*
+         * The variables are copied so that the parse appends to them, which
+         * keeps every index into the static ones, and every pointer to a
+         * definition among them, of a configuration the parse inherits
+         * valid.
+         */
+
+        if (ngx_array_init(&cmcf->variables, cf->pool,
+                           prev->variables.nelts + 4,
+                           sizeof(ngx_http_variable_t))
+            != NGX_OK)
+        {
+            return NULL;
+        }
+
+        if (prev->variables.nelts) {
+            v = ngx_array_push_n(&cmcf->variables, prev->variables.nelts);
+            if (v == NULL) {
+                return NULL;
+            }
+
+            ngx_memcpy(v, prev->variables.elts,
+                       prev->variables.nelts * sizeof(ngx_http_variable_t));
+        }
+
+        /* the keys are only needed until the variables are initialized */
+
+        cmcf->variables_keys = ngx_pcalloc(cf->temp_pool,
+                                           sizeof(ngx_hash_keys_arrays_t));
+        if (cmcf->variables_keys == NULL) {
+            return NULL;
+        }
+
+        cmcf->variables_keys->pool = cf->temp_pool;
+        cmcf->variables_keys->temp_pool = cf->temp_pool;
+
+        if (ngx_hash_keys_array_init(cmcf->variables_keys, NGX_HASH_SMALL)
+            != NGX_OK)
+        {
+            return NULL;
+        }
+
+        key = prev->variables_keys->keys.elts;
+
+        for (i = 0; i < prev->variables_keys->keys.nelts; i++) {
+
+            /*
+             * A copy of the definition, because resolving a name against it
+             * writes the index back into it, and in the temporary pool,
+             * because nothing reads it once the variables are resolved:
+             * what a request needs of it has been copied into the variable
+             * by then, and this configuration keeps no hash to reach it
+             * through.
+             */
+
+            av = ngx_palloc(cf->temp_pool, sizeof(ngx_http_variable_t));
+            if (av == NULL) {
+                return NULL;
+            }
+
+            *av = *(ngx_http_variable_t *) key[i].value;
+
+            /*
+             * A name of its own, as ngx_http_add_variable() gives one: the
+             * name of a variable the static configuration defines may be a
+             * literal, and adding a key lowercases the key it is given in
+             * place.
+             */
+
+            av->name.data = ngx_pnalloc(cf->temp_pool, av->name.len);
+            if (av->name.data == NULL) {
+                return NULL;
+            }
+
+            ngx_strlow(av->name.data,
+                       ((ngx_http_variable_t *) key[i].value)->name.data,
+                       av->name.len);
+
+            if (ngx_hash_add_key(cmcf->variables_keys, &av->name, av, 0)
+                != NGX_OK)
+            {
+                return NULL;
+            }
+        }
+
+        return cmcf;
     }
 
     if (ngx_array_init(&cmcf->servers, cf->pool, 4,
@@ -3583,10 +3697,6 @@ ngx_http_core_init_main_conf(ngx_conf_t *cf, void *conf)
 
     cmcf->variables_hash_bucket_size =
                ngx_align(cmcf->variables_hash_bucket_size, ngx_cacheline_size);
-
-    if (cmcf->ncaptures) {
-        cmcf->ncaptures = (cmcf->ncaptures + 1) * 3;
-    }
 
     return NGX_CONF_OK;
 }
@@ -4141,6 +4251,35 @@ ngx_http_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     value = cf->args->elts;
 
+    if (cf->dynamic) {
+
+        /*
+         * A dynamic server does not create the socket it listens on, so it
+         * cannot set an option of that socket, and "default_server" would
+         * change how the static configuration handles an address it owns.
+         * What describes the address is kept, and has to describe it the way
+         * the static configuration already does.
+         */
+
+        for (n = 2; n < cf->args->nelts; n++) {
+
+            if (ngx_strcmp(value[n].data, "ssl") == 0
+                || ngx_strcmp(value[n].data, "http2") == 0
+                || ngx_strcmp(value[n].data, "quic") == 0
+                || ngx_strcmp(value[n].data, "proxy_protocol") == 0)
+            {
+                continue;
+            }
+
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"%V\" is not supported in a dynamic "
+                               "configuration, where \"listen\" takes only "
+                               "the parameters describing the address",
+                               &value[n]);
+            return NGX_CONF_ERROR;
+        }
+    }
+
     ngx_memzero(&u, sizeof(ngx_url_t));
 
     u.url = value[1];
@@ -4588,6 +4727,18 @@ ngx_http_core_server_name(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     for (i = 1; i < cf->args->nelts; i++) {
 
         ch = value[i].data[0];
+
+        if (cf->dynamic
+            && (ch == '*' || ch == '.' || ch == '~'
+                || (value[i].len
+                    && value[i].data[value[i].len - 1] == '*')))
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "wildcard and regular expression server names "
+                               "are not supported in a dynamic "
+                               "configuration");
+            return NGX_CONF_ERROR;
+        }
 
         if ((ch == '*' && (value[i].len < 3 || value[i].data[1] != '.'))
             || (ch == '.' && value[i].len < 2))
