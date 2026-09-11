@@ -359,14 +359,14 @@ static ngx_command_t  ngx_http_upstream_commands[] = {
 #if (NGX_HTTP_UPSTREAM_ZONE)
 
     { ngx_string("resolver"),
-      NGX_HTTP_UPS_CONF|NGX_CONF_1MORE,
+      NGX_HTTP_UPS_CONF|NGX_STATIC_CONF|NGX_CONF_1MORE,
       ngx_http_upstream_resolver,
       NGX_HTTP_SRV_CONF_OFFSET,
       0,
       NULL },
 
     { ngx_string("resolver_timeout"),
-      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_UPS_CONF|NGX_STATIC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_msec_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_http_upstream_srv_conf_t, resolver_timeout),
@@ -394,7 +394,7 @@ static ngx_http_module_t  ngx_http_upstream_module_ctx = {
 
 
 ngx_module_t  ngx_http_upstream_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_DYN_CONF),
     &ngx_http_upstream_module_ctx,         /* module context */
     ngx_http_upstream_commands,            /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -6849,11 +6849,13 @@ ngx_http_upstream_add(ngx_conf_t *cf, ngx_url_t *u, ngx_uint_t flags)
         return uscfp[i];
     }
 
+#if !(NGX_HTTP_UPSTREAM_ZONE)
+
     if (cf->dynamic) {
         /*
-         * An upstream created here would be added to the static
-         * configuration, which the workers cannot see, and would never be
-         * initialized.
+         * The peers of an upstream a dynamic configuration creates are in
+         * a zone, where every worker finds them, and locking them needs
+         * the upstream zone module.
          */
 
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -6861,6 +6863,8 @@ ngx_http_upstream_add(ngx_conf_t *cf, ngx_url_t *u, ngx_uint_t flags)
                            "in the static configuration", &u->host);
         return NULL;
     }
+
+#endif
 
     uscf = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_srv_conf_t));
     if (uscf == NULL) {
@@ -7286,11 +7290,50 @@ ngx_http_upstream_merge_ssl_passwords(ngx_conf_t *cf,
 static void *
 ngx_http_upstream_create_main_conf(ngx_conf_t *cf)
 {
-    ngx_http_upstream_main_conf_t  *umcf;
+    ngx_uint_t                       n;
+    ngx_http_upstream_srv_conf_t   **uscfp;
+    ngx_http_upstream_main_conf_t   *umcf, *prev;
 
     umcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_main_conf_t));
     if (umcf == NULL) {
         return NULL;
+    }
+
+    if (cf->dynamic) {
+
+        /*
+         * Made from the one of the static configuration: the upstreams are
+         * what a dynamic configuration adds to here, and one the static
+         * configuration declares is still found by name among the copies.
+         */
+
+        prev = ngx_http_conf_get_module_main_conf(cf,
+                                                  ngx_http_upstream_module);
+
+        *umcf = *prev;
+
+        n = prev->upstreams.nelts;
+
+        if (ngx_array_init(&umcf->upstreams, cf->pool, n + 1,
+                           sizeof(ngx_http_upstream_srv_conf_t *))
+            != NGX_OK)
+        {
+            return NULL;
+        }
+
+        if (n) {
+            uscfp = ngx_array_push_n(&umcf->upstreams, n);
+            if (uscfp == NULL) {
+                return NULL;
+            }
+
+            ngx_memcpy(uscfp, prev->upstreams.elts,
+                       n * sizeof(ngx_http_upstream_srv_conf_t *));
+        }
+
+        umcf->inherited = n;
+
+        return umcf;
     }
 
     if (ngx_array_init(&umcf->upstreams, cf->pool, 4,
@@ -7319,7 +7362,7 @@ ngx_http_upstream_init_main_conf(ngx_conf_t *cf, void *conf)
 
     uscfp = umcf->upstreams.elts;
 
-    for (i = 0; i < umcf->upstreams.nelts; i++) {
+    for (i = umcf->inherited; i < umcf->upstreams.nelts; i++) {
 
         init = uscfp[i]->peer.init_upstream ? uscfp[i]->peer.init_upstream:
                                             ngx_http_upstream_init_round_robin;
@@ -7327,6 +7370,11 @@ ngx_http_upstream_init_main_conf(ngx_conf_t *cf, void *conf)
         if (init(cf, uscfp[i]) != NGX_OK) {
             return NGX_CONF_ERROR;
         }
+    }
+
+    if (umcf->inherited) {
+        /* the rest of it is that of the configuration this one was made from */
+        return NGX_CONF_OK;
     }
 
 

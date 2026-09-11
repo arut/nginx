@@ -15,6 +15,12 @@
                                     + ((p)->next ? (p)->next->tries : 0))
 
 
+#if (NGX_HTTP_UPSTREAM_ZONE)
+static ngx_int_t ngx_http_upstream_init_shared_peers(ngx_conf_t *cf,
+    ngx_http_upstream_srv_conf_t *us, ngx_http_upstream_rr_peers_t *peers);
+static void ngx_http_upstream_free_peer_sessions(void *data);
+#endif
+
 #if (NGX_HTTP_UPSTREAM_SID)
 static ngx_int_t ngx_http_upstream_create_sid(ngx_conf_t *cf,
     ngx_http_upstream_rr_peer_t *peer, ngx_str_t *route);
@@ -92,6 +98,22 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
 #if (NGX_HTTP_UPSTREAM_ZONE)
         if (us->shm_zone) {
 
+            if (resolve && cf->dynamic) {
+
+                /*
+                 * A worker arms the timer that resolves a name when it
+                 * starts, for the upstreams of the static configuration; a
+                 * file loaded later is not among them.
+                 */
+
+                ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                              "resolving names at run time is not supported"
+                              " in a dynamic configuration in upstream"
+                              " \"%V\" in %s:%ui",
+                              &us->host, us->file_name, us->line);
+                return NGX_ERROR;
+            }
+
             if (resolve && !(us->flags & NGX_HTTP_UPSTREAM_MODIFY)) {
                 ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
                               "load balancing method does not support"
@@ -159,6 +181,12 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
         peers->total_weight = w;
         peers->tries = t;
         peers->name = &us->host;
+
+#if (NGX_HTTP_UPSTREAM_ZONE)
+        if (ngx_http_upstream_init_shared_peers(cf, us, peers) != NGX_OK) {
+            return NGX_ERROR;
+        }
+#endif
 
         n = 0;
         peerp = &peers->peer;
@@ -302,6 +330,12 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
         backup->tries = t;
         backup->name = &us->host;
 
+#if (NGX_HTTP_UPSTREAM_ZONE)
+        if (ngx_http_upstream_init_shared_peers(cf, us, backup) != NGX_OK) {
+            return NGX_ERROR;
+        }
+#endif
+
         n = 0;
         peerp = &backup->peer;
 
@@ -430,6 +464,12 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
     peers->tries = n;
     peers->name = &us->host;
 
+#if (NGX_HTTP_UPSTREAM_ZONE)
+    if (ngx_http_upstream_init_shared_peers(cf, us, peers) != NGX_OK) {
+        return NGX_ERROR;
+    }
+#endif
+
     peerp = &peers->peer;
 
     for (i = 0; i < u.naddrs; i++) {
@@ -452,6 +492,68 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
 
     return NGX_OK;
 }
+
+
+#if (NGX_HTTP_UPSTREAM_ZONE)
+
+/*
+ * Peers built in a pool in shared memory are used by every worker, so they
+ * are locked as those of an upstream with a "zone" are.  One with a "zone"
+ * of its own is left alone: the upstream zone module copies its peers into
+ * it once the parse is done.
+ *
+ * A session saved for a peer is allocated from the pool they are locked
+ * with rather than from the one they are in, so destroying the latter would
+ * leave it behind, which is what the cleanup is for.
+ */
+
+static ngx_int_t
+ngx_http_upstream_init_shared_peers(ngx_conf_t *cf,
+    ngx_http_upstream_srv_conf_t *us, ngx_http_upstream_rr_peers_t *peers)
+{
+    ngx_pool_cleanup_t  *cln;
+
+    if (cf->pool->slab == NULL || us->shm_zone) {
+        return NGX_OK;
+    }
+
+    peers->shpool = cf->pool->slab;
+
+    cln = ngx_pool_cleanup_add(cf->pool, 0);
+    if (cln == NULL) {
+        return NGX_ERROR;
+    }
+
+    cln->handler = ngx_http_upstream_free_peer_sessions;
+    cln->data = peers;
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_upstream_free_peer_sessions(void *data)
+{
+#if (NGX_HTTP_SSL)
+
+    ngx_http_upstream_rr_peers_t *peers = data;
+
+    ngx_http_upstream_rr_peer_t  *peer;
+
+    for (peer = peers->peer; peer; peer = peer->next) {
+
+        if (peer->ssl_session) {
+            ngx_slab_free(peers->shpool, peer->ssl_session);
+
+            peer->ssl_session = NULL;
+            peer->ssl_session_len = 0;
+        }
+    }
+
+#endif
+}
+
+#endif
 
 
 #if (NGX_HTTP_UPSTREAM_SID)
