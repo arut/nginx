@@ -750,6 +750,12 @@ ngx_http_dynamic_include_parse(ngx_cycle_t *cycle,
 
     dcmcf->variables_keys = NULL;
 
+    /* the zones this file declared, as ngx_init_cycle() creates its own */
+
+    if (ngx_init_dynamic_zones(&cf) != NGX_OK) {
+        goto failed;
+    }
+
     ngx_destroy_pool(temp_pool);
 
     df->servers = &dcmcf->servers;
@@ -765,12 +771,18 @@ failed:
 
 
 /*
- * A copy of the running cycle, used while parsing.  Its lists of shared
- * memory zones, open files and paths are those of the running cycle, so
- * that a directive referring to one finds the one the static configuration
- * declares, which is memory the workers can see because it predates the
- * fork.  Creating a new one is refused where it happens, which is what
- * "dynamic_load" marks.
+ * A copy of the running cycle, used while parsing.  Its lists of open files
+ * and paths are those of the running cycle, so that a directive referring to
+ * one finds the one the static configuration declares, which is memory the
+ * workers can see because it predates the fork.  Creating a new one is
+ * refused where it happens, which is what "dynamic_load" marks.
+ *
+ * The zones are copied rather than shared, so that the file may declare one
+ * of its own: a list cannot be appended to without writing into the part the
+ * copy shares with the running cycle, and what a file adds has to be in its
+ * pool, where a request finds it.  Copying keeps every pointer to a zone of
+ * the running cycle valid, and a zone the file declares is its own, so
+ * another file may declare one of the same name.
  *
  * The lists a parse does append to get a copy of their own: the reload
  * handlers, so that nothing is registered twice, and the configuration dump,
@@ -781,7 +793,10 @@ static ngx_cycle_t *
 ngx_http_dynamic_include_copy_cycle(ngx_cycle_t *cycle, ngx_pool_t *pool,
     ngx_pool_t *temp_pool)
 {
-    ngx_cycle_t  *copy;
+    ngx_uint_t        i, n;
+    ngx_cycle_t      *copy;
+    ngx_shm_zone_t   *zone, *shm_zone;
+    ngx_list_part_t  *part;
 
     copy = ngx_palloc(temp_pool, sizeof(ngx_cycle_t));
     if (copy == NULL) {
@@ -798,6 +813,32 @@ ngx_http_dynamic_include_copy_cycle(ngx_cycle_t *cycle, ngx_pool_t *pool,
 
     copy->pool = pool;
     copy->dynamic_load = 1;
+
+    n = 0;
+
+    for (part = &cycle->shared_memory.part; part; part = part->next) {
+        n += part->nelts;
+    }
+
+    if (ngx_list_init(&copy->shared_memory, pool, n + 1,
+                      sizeof(ngx_shm_zone_t))
+        != NGX_OK)
+    {
+        return NULL;
+    }
+
+    for (part = &cycle->shared_memory.part; part; part = part->next) {
+        shm_zone = part->elts;
+
+        for (i = 0; i < part->nelts; i++) {
+            zone = ngx_list_push(&copy->shared_memory);
+            if (zone == NULL) {
+                return NULL;
+            }
+
+            *zone = shm_zone[i];
+        }
+    }
 
     if (ngx_array_init(&copy->dynamic, temp_pool, 1,
                        sizeof(ngx_dynamic_conf_t))

@@ -1429,12 +1429,18 @@ ngx_shared_memory_add(ngx_conf_t *cf, ngx_str_t *name, size_t size, void *tag)
         return &shm_zone[i];
     }
 
+#if !(NGX_HAVE_ATOMIC_OPS)
+
     if (cf->dynamic) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "the shared memory zone \"%V\" is not declared "
-                           "in the static configuration", name);
+                           "the shared memory zone \"%V\" cannot be created "
+                           "in a dynamic configuration on this platform, "
+                           "where a zone is locked with a file of its own",
+                           name);
         return NULL;
     }
+
+#endif
 
     shm_zone = ngx_list_push(&cf->cycle->shared_memory);
 
@@ -1453,6 +1459,81 @@ ngx_shared_memory_add(ngx_conf_t *cf, ngx_str_t *name, size_t size, void *tag)
     shm_zone->noreuse = 0;
 
     return shm_zone;
+}
+
+
+/*
+ * Creates the zones a dynamic configuration declared, once it is parsed, as
+ * ngx_init_cycle() creates those of a static one.  Each is a slab pool of
+ * its own taken from the pool of the file, so that releasing the file
+ * releases the zone with everything a module keeps in it, and every worker
+ * finds it at the address the master created it at, which is in a zone that
+ * predates the fork.
+ *
+ * The zones of the running cycle are in the same list, copied there when the
+ * parse began; the ones the file declared are those with no address yet.
+ */
+
+ngx_int_t
+ngx_init_dynamic_zones(ngx_conf_t *cf)
+{
+    void             *addr;
+    ngx_uint_t        i;
+    ngx_shm_zone_t   *shm_zone;
+    ngx_list_part_t  *part;
+
+    part = &cf->cycle->shared_memory.part;
+    shm_zone = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            shm_zone = part->elts;
+            i = 0;
+        }
+
+        if (shm_zone[i].shm.addr) {
+            continue;
+        }
+
+        if (shm_zone[i].shm.size == 0) {
+            ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                          "zero size shared memory zone \"%V\"",
+                          &shm_zone[i].shm.name);
+            return NGX_ERROR;
+        }
+
+        if (shm_zone[i].shm.size < 2 * ngx_pagesize) {
+
+            /* a slab pool holds nothing at all below that */
+
+            ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                          "the shared memory zone \"%V\" is too small",
+                          &shm_zone[i].shm.name);
+            return NGX_ERROR;
+        }
+
+        addr = ngx_palloc(cf->pool, shm_zone[i].shm.size);
+        if (addr == NULL) {
+            return NGX_ERROR;
+        }
+
+        shm_zone[i].shm.addr = addr;
+
+        if (ngx_init_zone_pool(cf->cycle, &shm_zone[i]) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        if (shm_zone[i].init(&shm_zone[i], NULL) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
 }
 
 

@@ -163,6 +163,7 @@ ngx_int_t ngx_dynamic_reload(ngx_cycle_t *cycle);
 
 ngx_shm_zone_t *ngx_shared_memory_add(ngx_conf_t *cf, ngx_str_t *name,
     size_t size, void *tag);
+ngx_int_t ngx_init_dynamic_zones(ngx_conf_t *cf);
 void ngx_set_shutdown_timer(ngx_cycle_t *cycle);
 
 
