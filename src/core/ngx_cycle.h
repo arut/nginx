@@ -78,6 +78,13 @@ struct ngx_cycle_s {
     /* of ngx_dynamic_conf_t, parts of the configuration reloaded at runtime */
     ngx_array_t               dynamic;
 
+    /*
+     * set in the copy of a cycle used while a dynamic configuration is
+     * parsed, where nothing may be created that the running cycle would
+     * have to keep
+     */
+    ngx_uint_t                dynamic_load;
+
     ngx_array_t               config_dump;
     ngx_rbtree_t              config_dump_rbtree;
     ngx_rbtree_node_t         config_dump_sentinel;

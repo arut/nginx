@@ -956,6 +956,13 @@ ngx_conf_open_file(ngx_cycle_t *cycle, ngx_str_t *name)
         }
     }
 
+    if (cycle->dynamic_load) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "\"%V\" is not a file the static configuration opens",
+                      name);
+        return NULL;
+    }
+
     file = ngx_list_push(&cycle->open_files);
     if (file == NULL) {
         return NULL;

@@ -593,6 +593,13 @@ ngx_add_path(ngx_conf_t *cf, ngx_path_t **slot)
         }
     }
 
+    if (cf->dynamic) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "the path \"%V\" is not declared "
+                           "in the static configuration", &path->name);
+        return NGX_ERROR;
+    }
+
     p = ngx_array_push(&cf->cycle->paths);
     if (p == NULL) {
         return NGX_ERROR;

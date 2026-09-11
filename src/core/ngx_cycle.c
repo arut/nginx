@@ -1429,6 +1429,13 @@ ngx_shared_memory_add(ngx_conf_t *cf, ngx_str_t *name, size_t size, void *tag)
         return &shm_zone[i];
     }
 
+    if (cf->dynamic) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "the shared memory zone \"%V\" is not declared "
+                           "in the static configuration", name);
+        return NULL;
+    }
+
     shm_zone = ngx_list_push(&cf->cycle->shared_memory);
 
     if (shm_zone == NULL) {

@@ -25,6 +25,13 @@ ngx_create_listening(ngx_conf_t *cf, struct sockaddr *sockaddr,
     struct sockaddr  *sa;
     u_char            text[NGX_SOCKADDR_STRLEN];
 
+    if (cf->dynamic) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "a listening socket cannot be created "
+                           "in a dynamic configuration");
+        return NULL;
+    }
+
     ls = ngx_array_push(&cf->cycle->listening);
     if (ls == NULL) {
         return NULL;
