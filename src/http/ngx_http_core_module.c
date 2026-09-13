@@ -715,7 +715,8 @@ static ngx_command_t  ngx_http_core_commands[] = {
       NULL },
 
     { ngx_string("open_file_cache"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE12,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF
+                        |NGX_CONF_NOARGS|NGX_CONF_TAKE12,
       ngx_http_core_open_file_cache,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_core_loc_conf_t, open_file_cache),
@@ -750,7 +751,7 @@ static ngx_command_t  ngx_http_core_commands[] = {
       NULL },
 
     { ngx_string("resolver"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_ANY,
       ngx_http_core_resolver,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
@@ -826,7 +827,7 @@ static ngx_http_module_t  ngx_http_core_module_ctx = {
 
 
 ngx_module_t  ngx_http_core_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_TENANT_CONF),
     &ngx_http_core_module_ctx,             /* module context */
     ngx_http_core_commands,                /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -3907,6 +3908,13 @@ ngx_http_core_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->error_log == NULL) {
         if (prev->error_log) {
             conf->error_log = prev->error_log;
+
+        } else if (ngx_conf_tenant(cf)) {
+
+            /* the cycle a tenant is parsed against does not outlive it */
+
+            conf->error_log = &((ngx_cycle_t *) ngx_cycle)->new_log;
+
         } else {
             conf->error_log = &cf->cycle->new_log;
         }
@@ -4107,6 +4115,32 @@ ngx_http_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     cscf->listen = 1;
 
     value = cf->args->elts;
+
+    if (ngx_conf_tenant(cf)) {
+
+        /*
+         * A tenant does not create the socket, so only what describes the
+         * address is kept, and has to describe it as the static one does.
+         */
+
+        for (n = 2; n < cf->args->nelts; n++) {
+
+            if (ngx_strcmp(value[n].data, "ssl") == 0
+                || ngx_strcmp(value[n].data, "http2") == 0
+                || ngx_strcmp(value[n].data, "quic") == 0
+                || ngx_strcmp(value[n].data, "proxy_protocol") == 0)
+            {
+                continue;
+            }
+
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"%V\" is not supported in a tenant, where "
+                               "\"listen\" takes only the parameters "
+                               "describing the address",
+                               &value[n]);
+            return NGX_CONF_ERROR;
+        }
+    }
 
     ngx_memzero(&u, sizeof(ngx_url_t));
 
@@ -4555,6 +4589,17 @@ ngx_http_core_server_name(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     for (i = 1; i < cf->args->nelts; i++) {
 
         ch = value[i].data[0];
+
+        if (ngx_conf_tenant(cf)
+            && (ch == '*' || ch == '.' || ch == '~'
+                || (value[i].len
+                    && value[i].data[value[i].len - 1] == '*')))
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "wildcard and regular expression server names "
+                               "are not supported in a tenant");
+            return NGX_CONF_ERROR;
+        }
 
         if ((ch == '*' && (value[i].len < 3 || value[i].data[1] != '.'))
             || (ch == '.' && value[i].len < 2))
@@ -5114,13 +5159,42 @@ ngx_http_core_open_file_cache(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_core_loc_conf_t *clcf = conf;
 
-    time_t       inactive;
-    ngx_str_t   *value, s;
-    ngx_int_t    max;
-    ngx_uint_t   i;
+    time_t                     inactive;
+    ngx_str_t                 *value, s;
+    ngx_int_t                  max;
+    ngx_uint_t                 i;
+    ngx_http_core_loc_conf_t  *sclcf;
 
     if (clcf->open_file_cache != NGX_CONF_UNSET_PTR) {
         return "is duplicate";
+    }
+
+    if (cf->args->nelts == 1) {
+
+        /*
+         * A cache keeps the descriptors of one process, which a tenant
+         * cannot make: named with no parameters, it is the static one.
+         */
+
+        if (!ngx_conf_tenant(cf)) {
+            return "requires parameters outside a tenant";
+        }
+
+        sclcf = ngx_http_conf_get_module_static_loc_conf(cf,
+                                                       ngx_http_core_module);
+
+        if (sclcf->open_file_cache == NGX_CONF_UNSET_PTR) {
+            return "is not declared by the static configuration";
+        }
+
+        clcf->open_file_cache = sclcf->open_file_cache;
+
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_conf_tenant(cf)) {
+        return "cannot be created in a tenant, "
+               "only named with no parameters";
     }
 
     value = cf->args->elts;
@@ -5249,10 +5323,47 @@ ngx_http_core_resolver(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_core_loc_conf_t  *clcf = conf;
 
-    ngx_str_t  *value;
+    ngx_str_t                 *value;
+    ngx_http_core_loc_conf_t  *sclcf;
 
     if (clcf->resolver) {
         return "is duplicate";
+    }
+
+    if (cf->args->nelts == 1) {
+
+        /*
+         * A resolver keeps the sockets and timers of one process, which a
+         * tenant cannot make: named with no address, it is the static one.
+         */
+
+        if (!ngx_conf_tenant(cf)) {
+            return "requires an address outside a tenant";
+        }
+
+        sclcf = ngx_http_conf_get_module_static_loc_conf(cf,
+                                                       ngx_http_core_module);
+
+        /*
+         * The http{} level of the static configuration always holds one,
+         * a dummy with no connections where nothing was configured, which
+         * resolves nothing and is what a server of that configuration
+         * would have inherited.
+         */
+
+        if (sclcf->resolver == NULL
+            || sclcf->resolver->connections.nelts == 0)
+        {
+            return "is not declared by the static configuration";
+        }
+
+        clcf->resolver = sclcf->resolver;
+
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_conf_tenant(cf)) {
+        return "cannot be created in a tenant, only named with no address";
     }
 
     value = cf->args->elts;
