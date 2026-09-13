@@ -327,7 +327,7 @@ static ngx_command_t ngx_http_uwsgi_commands[] = {
       NULL },
 
     { ngx_string("uwsgi_cache_path"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_2MORE,
+      NGX_HTTP_MAIN_CONF|NGX_CONF_ANY,
       ngx_http_file_cache_set_slot,
       NGX_HTTP_MAIN_CONF_OFFSET,
       offsetof(ngx_http_uwsgi_main_conf_t, caches),
@@ -618,7 +618,7 @@ static ngx_http_module_t ngx_http_uwsgi_module_ctx = {
 
 
 ngx_module_t ngx_http_uwsgi_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_TENANT_CONF),
     &ngx_http_uwsgi_module_ctx,            /* module context */
     ngx_http_uwsgi_commands,               /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -2003,7 +2003,17 @@ ngx_http_uwsgi_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_ptr_value(conf->ssl_conf_commands,
                               prev->ssl_conf_commands, NULL);
 
-    if (conf->ssl && ngx_http_uwsgi_set_ssl(cf, conf) != NGX_OK) {
+    /*
+     * A tenant cannot create a context: it is not pool memory, so a worker
+     * started before it was created cannot see it.  Its every *_ssl_*
+     * directive but the two naming a peer is refused, so there is nothing
+     * of its own to create one for.
+     */
+
+    if (conf->ssl
+        && !ngx_conf_tenant(cf)
+        && ngx_http_uwsgi_set_ssl(cf, conf) != NGX_OK)
+    {
         return NGX_CONF_ERROR;
     }
 
@@ -2477,7 +2487,14 @@ ngx_http_uwsgi_cache(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    if (cv.lengths != NULL) {
+    /*
+     * In a tenant the name is resolved while the request is served, as one
+     * with variables in it is, so that it is looked up among the caches
+     * the tenant named with "*_cache_path" and not among every zone the
+     * static configuration declares.
+     */
+
+    if (cv.lengths != NULL || ngx_conf_tenant(cf)) {
 
         uwcf->upstream.cache_value = ngx_palloc(cf->pool,
                                              sizeof(ngx_http_complex_value_t));
@@ -2686,6 +2703,25 @@ ngx_http_uwsgi_merge_ssl(ngx_conf_t *cf, ngx_http_uwsgi_loc_conf_t *conf,
         preserve = 1;
 
     } else {
+
+        /*
+         * A tenant cannot configure SSL towards a backend: an SSL_CTX is
+         * not pool memory, so a worker started before one was created
+         * cannot see it, and a tenant is made after the workers have
+         * forked.  Only the two directives naming the peer of a single
+         * connection, "uwsgi_ssl_name" and "uwsgi_ssl_server_name", are a
+         * tenant's own, and neither is among those tested above.
+         */
+
+        if (ngx_conf_tenant(cf)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "the \"uwsgi_ssl_*\" directives are not "
+                               "supported in a tenant, apart from "
+                               "\"uwsgi_ssl_name\" and "
+                               "\"uwsgi_ssl_server_name\"");
+            return NGX_ERROR;
+        }
+
         preserve = 0;
     }
 

@@ -1426,11 +1426,8 @@ ngx_http_ssl_init(ngx_conf_t *cf)
     if (ngx_conf_tenant(cf)) {
 
         /*
-         * A tenant configures no SSL of its own, this module not being
-         * eligible for one, and the addresses it listens on are those of
-         * the static configuration, which has been asked of them already.
-         * What a tenant is served with is the context of the default
-         * server of its address.
+         * A tenant configures no SSL of its own and listens on addresses
+         * of the static configuration, already asked of them here.
          */
 
         return NGX_OK;

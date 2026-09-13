@@ -497,7 +497,7 @@ static ngx_http_module_t  ngx_http_grpc_module_ctx = {
 
 
 ngx_module_t  ngx_http_grpc_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_TENANT_CONF),
     &ngx_http_grpc_module_ctx,             /* module context */
     ngx_http_grpc_commands,                /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -4699,7 +4699,17 @@ ngx_http_grpc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_ptr_value(conf->ssl_conf_commands,
                               prev->ssl_conf_commands, NULL);
 
-    if (conf->ssl && ngx_http_grpc_set_ssl(cf, conf) != NGX_OK) {
+    /*
+     * A tenant cannot create a context: it is not pool memory, so a worker
+     * started before it was created cannot see it.  Its every *_ssl_*
+     * directive but the two naming a peer is refused, so there is nothing
+     * of its own to create one for.
+     */
+
+    if (conf->ssl
+        && !ngx_conf_tenant(cf)
+        && ngx_http_grpc_set_ssl(cf, conf) != NGX_OK)
+    {
         return NGX_CONF_ERROR;
     }
 
@@ -5214,6 +5224,25 @@ ngx_http_grpc_merge_ssl(ngx_conf_t *cf, ngx_http_grpc_loc_conf_t *conf,
         preserve = 1;
 
     } else {
+
+        /*
+         * A tenant cannot configure SSL towards a backend: an SSL_CTX is
+         * not pool memory, so a worker started before one was created
+         * cannot see it, and a tenant is made after the workers have
+         * forked.  Only the two directives naming the peer of a single
+         * connection, "grpc_ssl_name" and "grpc_ssl_server_name", are a
+         * tenant's own, and neither is among those tested above.
+         */
+
+        if (ngx_conf_tenant(cf)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "the \"grpc_ssl_*\" directives are not "
+                               "supported in a tenant, apart from "
+                               "\"grpc_ssl_name\" and "
+                               "\"grpc_ssl_server_name\"");
+            return NGX_ERROR;
+        }
+
         preserve = 0;
     }
 

@@ -2390,7 +2390,48 @@ ngx_http_file_cache_set_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                             manager_threshold;
     ngx_uint_t              i, n, use_temp_path;
     ngx_array_t            *caches;
+    ngx_shm_zone_t         *shm_zone;
     ngx_http_file_cache_t  *cache, **ce;
+
+    caches = (ngx_array_t *) (confp + cmd->offset);
+
+    value = cf->args->elts;
+
+    if (cf->args->nelts == 2) {
+
+        /*
+         * The manager and the loader walk the paths of the running cycle,
+         * which a tenant never joins, so a tenant names a cache the static
+         * configuration declared by the name of its zone.
+         */
+
+        if (!ngx_conf_tenant(cf)) {
+            return "requires the parameters of a cache outside a tenant";
+        }
+
+        shm_zone = ngx_shared_memory_add(cf, &value[1], 0, cmd->post);
+        if (shm_zone == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        if (shm_zone->data == NULL) {
+            return "names a zone the static configuration does not declare";
+        }
+
+        ce = ngx_array_push(caches);
+        if (ce == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        *ce = shm_zone->data;
+
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_conf_tenant(cf)) {
+        return "cannot be declared in a tenant, "
+               "only named by the name of its zone";
+    }
 
     cache = ngx_pcalloc(cf->pool, sizeof(ngx_http_file_cache_t));
     if (cache == NULL) {
@@ -2418,8 +2459,6 @@ ngx_http_file_cache_set_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     size = 0;
     max_size = NGX_MAX_OFF_T_VALUE;
     min_free = 0;
-
-    value = cf->args->elts;
 
     cache->path->name = value[1];
 
@@ -2708,8 +2747,6 @@ ngx_http_file_cache_set_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     cache->inactive = inactive;
     cache->max_size = max_size;
     cache->min_free = min_free;
-
-    caches = (ngx_array_t *) (confp + cmd->offset);
 
     ce = ngx_array_push(caches);
     if (ce == NULL) {
