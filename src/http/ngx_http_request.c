@@ -2474,10 +2474,12 @@ ngx_http_validate_host(ngx_str_t *host, in_port_t *portp, ngx_pool_t *pool,
 ngx_int_t
 ngx_http_set_virtual_server(ngx_http_request_t *r, ngx_str_t *host)
 {
-    ngx_int_t                  rc;
-    ngx_http_connection_t     *hc;
-    ngx_http_core_loc_conf_t  *clcf;
-    ngx_http_core_srv_conf_t  *cscf;
+    ngx_int_t                   rc;
+    void                      **main_conf;
+    ngx_http_connection_t      *hc;
+    ngx_http_core_loc_conf_t   *clcf;
+    ngx_http_core_srv_conf_t   *cscf;
+    ngx_http_core_main_conf_t  *cmcf;
 
 #if (NGX_SUPPRESS_WARN)
     cscf = NULL;
@@ -2511,6 +2513,15 @@ ngx_http_set_virtual_server(ngx_http_request_t *r, ngx_str_t *host)
                                       hc->addr_conf->virtual_names,
                                       host, r, &cscf);
 
+#if (NGX_HTTP_TENANT)
+
+    if (rc == NGX_DECLINED) {
+        /* the static configuration wins over a tenant */
+        rc = ngx_http_tenant_find(r, host, &cscf);
+    }
+
+#endif
+
     if (rc == NGX_ERROR) {
         ngx_http_close_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return NGX_ERROR;
@@ -2543,8 +2554,43 @@ ngx_http_set_virtual_server(ngx_http_request_t *r, ngx_str_t *host)
         return NGX_OK;
     }
 
+    /*
+     * A tenant has a main configuration of its own, which is where what
+     * it keeps at that level is found.  A static server shares the one
+     * already in use, so that this changes nothing for it.  Nothing has
+     * been read from it at this point but what the two have in common.
+     */
+
+    main_conf = r->main_conf;
+
+    r->main_conf = cscf->ctx->main_conf;
     r->srv_conf = cscf->ctx->srv_conf;
     r->loc_conf = cscf->ctx->loc_conf;
+
+    /*
+     * The variables of a tenant are its own, registered by the modules
+     * eligible for it, so an index means nothing outside the configuration
+     * that assigned it and no value already evaluated carries over.  A
+     * request switching to a tenant, or back out of one, therefore starts
+     * the variables of the one it arrives in afresh.  Nothing has been read
+     * at this point but the request line and the headers, which are held by
+     * the request itself rather than by a variable.
+     */
+
+    if (r->main_conf != main_conf) {
+        cmcf = ngx_http_get_module_main_conf(r, ngx_http_core_module);
+
+        r->variables = ngx_pcalloc(r->pool, cmcf->variables.nelts
+                                         * sizeof(ngx_http_variable_value_t));
+        if (r->variables == NULL) {
+            ngx_http_close_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return NGX_ERROR;
+        }
+    }
+
+    /* a regular expression of the file may have more captures */
+
+    r->realloc_captures = 1;
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 

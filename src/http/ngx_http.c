@@ -11,12 +11,6 @@
 
 
 static char *ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static ngx_int_t ngx_http_init_phases(ngx_conf_t *cf,
-    ngx_http_core_main_conf_t *cmcf);
-static ngx_int_t ngx_http_init_headers_in_hash(ngx_conf_t *cf,
-    ngx_http_core_main_conf_t *cmcf);
-static ngx_int_t ngx_http_init_phase_handlers(ngx_conf_t *cf,
-    ngx_http_core_main_conf_t *cmcf);
 
 static ngx_int_t ngx_http_add_addresses(ngx_conf_t *cf,
     ngx_http_core_srv_conf_t *cscf, ngx_http_conf_port_t *port,
@@ -27,16 +21,9 @@ static ngx_int_t ngx_http_add_address(ngx_conf_t *cf,
 static ngx_int_t ngx_http_add_server(ngx_conf_t *cf,
     ngx_http_core_srv_conf_t *cscf, ngx_http_conf_addr_t *addr);
 
-static char *ngx_http_merge_servers(ngx_conf_t *cf,
-    ngx_http_core_main_conf_t *cmcf, ngx_http_module_t *module,
-    ngx_uint_t ctx_index);
 static char *ngx_http_merge_locations(ngx_conf_t *cf,
     ngx_queue_t *locations, void **loc_conf, ngx_http_module_t *module,
     ngx_uint_t ctx_index);
-static ngx_int_t ngx_http_init_locations(ngx_conf_t *cf,
-    ngx_http_core_srv_conf_t *cscf, ngx_http_core_loc_conf_t *pclcf);
-static ngx_int_t ngx_http_init_static_location_trees(ngx_conf_t *cf,
-    ngx_http_core_loc_conf_t *pclcf);
 static ngx_int_t ngx_http_escape_location_name(ngx_conf_t *cf,
     ngx_http_core_loc_conf_t *clcf);
 static ngx_int_t ngx_http_cmp_locations(const ngx_queue_t *one,
@@ -268,7 +255,7 @@ ngx_http_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
         }
 
-        rv = ngx_http_merge_servers(cf, cmcf, module, mi);
+        rv = ngx_http_merge_servers(cf, cmcf, cf->cycle->modules[m]);
         if (rv != NGX_CONF_OK) {
             goto failed;
         }
@@ -347,7 +334,7 @@ failed:
 }
 
 
-static ngx_int_t
+ngx_int_t
 ngx_http_init_phases(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf)
 {
     if (ngx_array_init(&cmcf->phases[NGX_HTTP_POST_READ_PHASE].handlers,
@@ -410,7 +397,7 @@ ngx_http_init_phases(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf)
 }
 
 
-static ngx_int_t
+ngx_int_t
 ngx_http_init_headers_in_hash(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf)
 {
     ngx_array_t         headers_in;
@@ -451,7 +438,7 @@ ngx_http_init_headers_in_hash(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf)
 }
 
 
-static ngx_int_t
+ngx_int_t
 ngx_http_init_phase_handlers(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf)
 {
     ngx_int_t                   j;
@@ -560,10 +547,13 @@ ngx_http_init_phase_handlers(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf)
 }
 
 
-static char *
+char *
 ngx_http_merge_servers(ngx_conf_t *cf, ngx_http_core_main_conf_t *cmcf,
-    ngx_http_module_t *module, ngx_uint_t ctx_index)
+    ngx_module_t *mod)
 {
+    ngx_http_module_t           *module = mod->ctx;
+    ngx_uint_t                   ctx_index = mod->ctx_index;
+
     char                        *rv;
     ngx_uint_t                   s;
     ngx_http_conf_ctx_t         *ctx, saved;
@@ -667,7 +657,7 @@ ngx_http_merge_locations(ngx_conf_t *cf, ngx_queue_t *locations,
 }
 
 
-static ngx_int_t
+ngx_int_t
 ngx_http_init_locations(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
     ngx_http_core_loc_conf_t *pclcf)
 {
@@ -831,7 +821,7 @@ ngx_http_init_locations(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
 }
 
 
-static ngx_int_t
+ngx_int_t
 ngx_http_init_static_location_trees(ngx_conf_t *cf,
     ngx_http_core_loc_conf_t *pclcf)
 {

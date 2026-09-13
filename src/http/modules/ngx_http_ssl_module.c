@@ -1423,6 +1423,19 @@ ngx_http_ssl_init(ngx_conf_t *cf)
         return NGX_OK;
     }
 
+    if (ngx_conf_tenant(cf)) {
+
+        /*
+         * A tenant configures no SSL of its own, this module not being
+         * eligible for one, and the addresses it listens on are those of
+         * the static configuration, which has been asked of them already.
+         * What a tenant is served with is the context of the default
+         * server of its address.
+         */
+
+        return NGX_OK;
+    }
+
     port = cmcf->ports->elts;
     for (p = 0; p < cmcf->ports->nelts; p++) {
 
