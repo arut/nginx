@@ -394,7 +394,7 @@ static ngx_http_module_t  ngx_http_upstream_module_ctx = {
 
 
 ngx_module_t  ngx_http_upstream_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_TENANT_CONF),
     &ngx_http_upstream_module_ctx,         /* module context */
     ngx_http_upstream_commands,            /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -6766,6 +6766,16 @@ ngx_http_upstream_resolver(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return "is duplicate";
     }
 
+    if (ngx_conf_tenant(cf)) {
+
+        /*
+         * A resolver keeps the sockets and timers of one process, and
+         * serves "server ... resolve", which is refused in a tenant.
+         */
+
+        return "is not supported in a tenant";
+    }
+
     value = cf->args->elts;
 
     uscf->resolver = ngx_resolver_create(cf, &value[1], cf->args->nelts - 1);
@@ -6848,6 +6858,25 @@ ngx_http_upstream_add(ngx_conf_t *cf, ngx_url_t *u, ngx_uint_t flags)
 
         return uscfp[i];
     }
+
+#if !(NGX_HTTP_UPSTREAM_ZONE)
+
+    if (ngx_conf_tenant(cf)) {
+
+        /*
+         * The peers of an upstream a tenant has are in a zone, where every
+         * worker finds them, and locking them is what the upstream zone
+         * module does; without it a tenant can reach no backend at all.
+         */
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "a backend cannot be reached from a tenant, "
+                           "nginx was built without the upstream zone "
+                           "module");
+        return NULL;
+    }
+
+#endif
 
     uscf = ngx_pcalloc(cf->pool, sizeof(ngx_http_upstream_srv_conf_t));
     if (uscf == NULL) {
