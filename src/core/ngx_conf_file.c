@@ -399,12 +399,7 @@ ngx_conf_handler(ngx_conf_t *cf, ngx_int_t last)
                 continue;
             }
 
-            /*
-             * is the module, and the directive, eligible for this dynamic
-             * configuration ?  The block a tenant is held in is the frame
-             * of one rather than something it configures, so it is asked
-             * of every directive but that.
-             */
+            /* the block a tenant is held in is the frame of one */
 
             if (cf->dynamic
                 && !(cmd->type & NGX_TENANT_CONF)
@@ -956,6 +951,13 @@ ngx_conf_open_file(ngx_cycle_t *cycle, ngx_str_t *name)
                 return &file[i];
             }
         }
+    }
+
+    if (cycle->dynamic_load) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "\"%V\" is not a file the static configuration opens",
+                      name);
+        return NULL;
     }
 
     file = ngx_list_push(&cycle->open_files);

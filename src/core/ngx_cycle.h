@@ -78,6 +78,12 @@ struct ngx_cycle_s {
     /* of ngx_dynamic_conf_t, parts of the configuration reloaded at runtime */
     ngx_array_t               dynamic;
 
+    /*
+     * set in the copy of a cycle used while a tenant is parsed, where
+     * nothing may be created that the running cycle would have to keep
+     */
+    ngx_uint_t                dynamic_load;
+
     ngx_array_t               config_dump;
     ngx_rbtree_t              config_dump_rbtree;
     ngx_rbtree_node_t         config_dump_sentinel;
@@ -156,6 +162,7 @@ ngx_int_t ngx_dynamic_reload(ngx_cycle_t *cycle);
 
 ngx_shm_zone_t *ngx_shared_memory_add(ngx_conf_t *cf, ngx_str_t *name,
     size_t size, void *tag);
+ngx_int_t ngx_init_dynamic_zones(ngx_conf_t *cf);
 void ngx_set_shutdown_timer(ngx_cycle_t *cycle);
 
 
