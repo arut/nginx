@@ -399,6 +399,24 @@ ngx_conf_handler(ngx_conf_t *cf, ngx_int_t last)
                 continue;
             }
 
+            /*
+             * is the module, and the directive, eligible for this dynamic
+             * configuration ?  The block a tenant is held in is the frame
+             * of one rather than something it configures, so it is asked
+             * of every directive but that.
+             */
+
+            if (cf->dynamic
+                && !(cmd->type & NGX_TENANT_CONF)
+                && !ngx_module_tenant(cf->cycle->modules[i], cf->dynamic))
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "directive \"%s\" is not supported "
+                                   "in a tenant",
+                                   name->data);
+                return NGX_ERROR;
+            }
+
             if (!(cmd->type & NGX_CONF_BLOCK) && last != NGX_OK) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                   "directive \"%s\" is not terminated by \";\"",

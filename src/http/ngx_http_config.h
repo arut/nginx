@@ -38,6 +38,14 @@ typedef struct {
 
 #define NGX_HTTP_MODULE           0x50545448   /* "HTTP" */
 
+/*
+ * What an http module advertises in its flags: that its directives are
+ * allowed in a tenant.  A module advertising nothing has them refused; its
+ * configurations are still made, a module nothing configures doing nothing.
+ */
+#define NGX_HTTP_TENANT_CONF      0x00000001
+
+
 #define NGX_HTTP_MAIN_CONF        0x02000000
 #define NGX_HTTP_SRV_CONF         0x04000000
 #define NGX_HTTP_LOC_CONF         0x08000000
@@ -64,6 +72,19 @@ typedef struct {
     ((ngx_http_conf_ctx_t *) cf->ctx)->srv_conf[module.ctx_index]
 #define ngx_http_conf_get_module_loc_conf(cf, module)                         \
     ((ngx_http_conf_ctx_t *) cf->ctx)->loc_conf[module.ctx_index]
+
+/*
+ * The enclosing static level, for what a tenant may not create for itself.
+ * Every use of it decides something for every tenant.
+ */
+
+#define ngx_http_conf_get_module_static_main_conf(cf, module)                 \
+    ((ngx_http_conf_ctx_t *) cf->static_ctx)->main_conf[module.ctx_index]
+#define ngx_http_conf_get_module_static_srv_conf(cf, module)                  \
+    ((ngx_http_conf_ctx_t *) cf->static_ctx)->srv_conf[module.ctx_index]
+#define ngx_http_conf_get_module_static_loc_conf(cf, module)                  \
+    ((ngx_http_conf_ctx_t *) cf->static_ctx)->loc_conf[module.ctx_index]
+
 
 #define ngx_http_cycle_get_module_main_conf(cycle, module)                    \
     (cycle->conf_ctx[ngx_http_module.index] ?                                 \

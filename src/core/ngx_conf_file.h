@@ -48,6 +48,12 @@
 
 #define NGX_DIRECT_CONF      0x00010000
 
+/*
+ * the level a tenant file is parsed at, which holds one directive, the
+ * http{} block of the tenant, and nothing else
+ */
+#define NGX_TENANT_CONF      0x00040000
+
 #define NGX_MAIN_CONF        0x01000000
 #define NGX_ANY_CONF         0xFF000000
 
@@ -127,9 +133,18 @@ struct ngx_conf_s {
     ngx_uint_t            module_type;
     ngx_uint_t            cmd_type;
 
+    /* the kind of tenant being parsed, or zero for the static configuration */
+    ngx_uint_t            dynamic;
+
+    /* the enclosing static level, for what a tenant may not create itself */
+    void                 *static_ctx;
+
     ngx_conf_handler_pt   handler;
     void                 *handler_conf;
 };
+
+
+#define ngx_conf_tenant(cf)  ((cf)->dynamic)
 
 
 typedef char *(*ngx_conf_post_handler_pt) (ngx_conf_t *cf,
