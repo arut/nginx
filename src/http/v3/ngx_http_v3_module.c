@@ -98,7 +98,7 @@ static ngx_http_module_t  ngx_http_v3_module_ctx = {
 
 
 ngx_module_t  ngx_http_v3_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_TENANT_CONF),
     &ngx_http_v3_module_ctx,               /* module context */
     ngx_http_v3_commands,                  /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -249,6 +249,17 @@ ngx_http_v3_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->quic.active_connection_id_limit,
                               prev->quic.active_connection_id_limit,
                               2);
+
+    if (ngx_conf_tenant(cf)) {
+
+        /*
+         * A connection is run with the configuration of the default server
+         * of its address, which a tenant is never: only "http3" and
+         * "http3_hq" are read for one, the rest accepted and ignored.
+         */
+
+        return NGX_CONF_OK;
+    }
 
     if (conf->quic.host_key.len == 0) {
 
