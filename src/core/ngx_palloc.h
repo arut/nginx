@@ -27,6 +27,8 @@
               NGX_POOL_ALIGNMENT)
 
 
+typedef struct ngx_slab_pool_s  ngx_slab_pool_t;
+
 typedef void (*ngx_pool_cleanup_pt)(void *data);
 
 typedef struct ngx_pool_cleanup_s  ngx_pool_cleanup_t;
@@ -62,6 +64,12 @@ struct ngx_pool_s {
     ngx_pool_large_t     *large;
     ngx_pool_cleanup_t   *cleanup;
     ngx_log_t            *log;
+
+    /*
+     * when set, all pool memory is allocated from this slab pool,
+     * which makes the pool suitable for a shared memory zone
+     */
+    ngx_slab_pool_t      *slab;
 };
 
 
@@ -73,6 +81,8 @@ typedef struct {
 
 
 ngx_pool_t *ngx_create_pool(size_t size, ngx_log_t *log);
+ngx_pool_t *ngx_create_shared_pool(size_t size, ngx_log_t *log,
+    ngx_slab_pool_t *slab);
 void ngx_destroy_pool(ngx_pool_t *pool);
 void ngx_reset_pool(ngx_pool_t *pool);
 

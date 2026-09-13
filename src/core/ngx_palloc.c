@@ -13,17 +13,73 @@ static ngx_inline void *ngx_palloc_small(ngx_pool_t *pool, size_t size,
     ngx_uint_t align);
 static void *ngx_palloc_block(ngx_pool_t *pool, size_t size);
 static void *ngx_palloc_large(ngx_pool_t *pool, size_t size);
+static void *ngx_pool_alloc(ngx_pool_t *pool, size_t size, size_t alignment);
+static void ngx_pool_free(ngx_slab_pool_t *slab, void *p);
 
 
-ngx_pool_t *
-ngx_create_pool(size_t size, ngx_log_t *log)
+/*
+ * All pool memory is obtained through ngx_pool_alloc()/ngx_pool_free().
+ * For an ordinary pool these are plain malloc()/free().  For a pool created
+ * by ngx_create_shared_pool() they allocate from a slab pool, which makes
+ * the entire pool, including its large allocations, reside in shared memory.
+ */
+
+static void *
+ngx_pool_alloc(ngx_pool_t *pool, size_t size, size_t alignment)
+{
+    void  *p;
+
+    if (pool->slab == NULL) {
+        return alignment ? ngx_memalign(alignment, size, pool->log)
+                         : ngx_alloc(size, pool->log);
+    }
+
+    /*
+     * ngx_slab_alloc() returns memory aligned to the size class, which is
+     * at least NGX_ALIGNMENT for any class the pool uses; a stricter
+     * alignment cannot be requested from a slab pool.
+     */
+
+    p = ngx_slab_alloc(pool->slab, size);
+
+    if (p == NULL) {
+        ngx_log_error(NGX_LOG_ERR, pool->log, 0,
+                      "could not allocate %uz bytes in a shared pool", size);
+    }
+
+    return p;
+}
+
+
+static void
+ngx_pool_free(ngx_slab_pool_t *slab, void *p)
+{
+    if (slab == NULL) {
+        ngx_free(p);
+        return;
+    }
+
+    ngx_slab_free(slab, p);
+}
+
+
+static ngx_pool_t *
+ngx_create_pool_internal(size_t size, ngx_log_t *log, ngx_slab_pool_t *slab)
 {
     ngx_pool_t  *p;
 
-    p = ngx_memalign(NGX_POOL_ALIGNMENT, size, log);
+    if (slab) {
+        p = ngx_slab_alloc(slab, size);
+
+    } else {
+        p = ngx_memalign(NGX_POOL_ALIGNMENT, size, log);
+    }
+
     if (p == NULL) {
         return NULL;
     }
+
+    p->slab = slab;
 
     p->d.last = (u_char *) p + sizeof(ngx_pool_t);
     p->d.end = (u_char *) p + size;
@@ -43,12 +99,30 @@ ngx_create_pool(size_t size, ngx_log_t *log)
 }
 
 
+ngx_pool_t *
+ngx_create_pool(size_t size, ngx_log_t *log)
+{
+    return ngx_create_pool_internal(size, log, NULL);
+}
+
+
+ngx_pool_t *
+ngx_create_shared_pool(size_t size, ngx_log_t *log, ngx_slab_pool_t *slab)
+{
+    return ngx_create_pool_internal(size, log, slab);
+}
+
+
 void
 ngx_destroy_pool(ngx_pool_t *pool)
 {
     ngx_pool_t          *p, *n;
+    ngx_slab_pool_t     *slab;
     ngx_pool_large_t    *l;
     ngx_pool_cleanup_t  *c;
+
+    /* pool itself is freed below, so the allocator must be saved */
+    slab = pool->slab;
 
     for (c = pool->cleanup; c; c = c->next) {
         if (c->handler) {
@@ -82,12 +156,12 @@ ngx_destroy_pool(ngx_pool_t *pool)
 
     for (l = pool->large; l; l = l->next) {
         if (l->alloc) {
-            ngx_free(l->alloc);
+            ngx_pool_free(slab, l->alloc);
         }
     }
 
     for (p = pool, n = pool->d.next; /* void */; p = n, n = n->d.next) {
-        ngx_free(p);
+        ngx_pool_free(slab, p);
 
         if (n == NULL) {
             break;
@@ -104,7 +178,7 @@ ngx_reset_pool(ngx_pool_t *pool)
 
     for (l = pool->large; l; l = l->next) {
         if (l->alloc) {
-            ngx_free(l->alloc);
+            ngx_pool_free(pool->slab, l->alloc);
         }
     }
 
@@ -183,7 +257,7 @@ ngx_palloc_block(ngx_pool_t *pool, size_t size)
 
     psize = (size_t) (pool->d.end - (u_char *) pool);
 
-    m = ngx_memalign(NGX_POOL_ALIGNMENT, psize, pool->log);
+    m = ngx_pool_alloc(pool, psize, NGX_POOL_ALIGNMENT);
     if (m == NULL) {
         return NULL;
     }
@@ -217,7 +291,7 @@ ngx_palloc_large(ngx_pool_t *pool, size_t size)
     ngx_uint_t         n;
     ngx_pool_large_t  *large;
 
-    p = ngx_alloc(size, pool->log);
+    p = ngx_pool_alloc(pool, size, 0);
     if (p == NULL) {
         return NULL;
     }
@@ -237,7 +311,7 @@ ngx_palloc_large(ngx_pool_t *pool, size_t size)
 
     large = ngx_palloc_small(pool, sizeof(ngx_pool_large_t), 1);
     if (large == NULL) {
-        ngx_free(p);
+        ngx_pool_free(pool->slab, p);
         return NULL;
     }
 
@@ -255,14 +329,14 @@ ngx_pmemalign(ngx_pool_t *pool, size_t size, size_t alignment)
     void              *p;
     ngx_pool_large_t  *large;
 
-    p = ngx_memalign(alignment, size, pool->log);
+    p = ngx_pool_alloc(pool, size, alignment);
     if (p == NULL) {
         return NULL;
     }
 
     large = ngx_palloc_small(pool, sizeof(ngx_pool_large_t), 1);
     if (large == NULL) {
-        ngx_free(p);
+        ngx_pool_free(pool->slab, p);
         return NULL;
     }
 
@@ -283,7 +357,7 @@ ngx_pfree(ngx_pool_t *pool, void *p)
         if (p == l->alloc) {
             ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, pool->log, 0,
                            "free: %p", l->alloc);
-            ngx_free(l->alloc);
+            ngx_pool_free(pool->slab, l->alloc);
             l->alloc = NULL;
 
             return NGX_OK;
