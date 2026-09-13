@@ -24,6 +24,21 @@
 
 typedef struct ngx_shm_zone_s  ngx_shm_zone_t;
 
+/*
+ * A dynamic configuration part is registered while the static configuration
+ * is being loaded.  Its handler is called at the end of the static load and
+ * on every subsequent dynamic reload; it is expected to detect whether the
+ * underlying configuration changed and to reload it if so.
+ */
+
+typedef ngx_int_t (*ngx_dynamic_handler_pt)(ngx_cycle_t *cycle, void *data);
+
+typedef struct {
+    ngx_dynamic_handler_pt    handler;
+    void                     *data;
+    ngx_str_t                 name;
+} ngx_dynamic_conf_t;
+
 typedef ngx_int_t (*ngx_shm_zone_init_pt) (ngx_shm_zone_t *zone, void *data);
 
 struct ngx_shm_zone_s {
@@ -59,6 +74,9 @@ struct ngx_cycle_s {
 
     ngx_array_t               listening;
     ngx_array_t               paths;
+
+    /* of ngx_dynamic_conf_t, parts of the configuration reloaded at runtime */
+    ngx_array_t               dynamic;
 
     ngx_array_t               config_dump;
     ngx_rbtree_t              config_dump_rbtree;
@@ -133,6 +151,9 @@ void ngx_reopen_files(ngx_cycle_t *cycle, ngx_uid_t user);
 char **ngx_set_environment(ngx_cycle_t *cycle, ngx_uint_t *last);
 ngx_pid_t ngx_exec_new_binary(ngx_cycle_t *cycle, char *const *argv);
 ngx_cpuset_t *ngx_get_cpu_affinity(ngx_uint_t n);
+ngx_dynamic_conf_t *ngx_dynamic_add(ngx_conf_t *cf, ngx_str_t *name);
+ngx_int_t ngx_dynamic_reload(ngx_cycle_t *cycle);
+
 ngx_shm_zone_t *ngx_shared_memory_add(ngx_conf_t *cf, ngx_str_t *name,
     size_t size, void *tag);
 void ngx_set_shutdown_timer(ngx_cycle_t *cycle);
