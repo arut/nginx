@@ -151,6 +151,7 @@ static ngx_int_t ngx_http_log_check_length(ngx_http_request_t *r,
 
 
 static void *ngx_http_log_create_main_conf(ngx_conf_t *cf);
+static char *ngx_http_log_init_main_conf(ngx_conf_t *cf, void *conf);
 static void *ngx_http_log_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_log_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -183,7 +184,8 @@ static ngx_command_t  ngx_http_log_commands[] = {
       NULL },
 
     { ngx_string("open_log_file_cache"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1234,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF
+                        |NGX_CONF_NOARGS|NGX_CONF_TAKE1234,
       ngx_http_log_open_file_cache,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
@@ -198,7 +200,7 @@ static ngx_http_module_t  ngx_http_log_module_ctx = {
     ngx_http_log_init,                     /* postconfiguration */
 
     ngx_http_log_create_main_conf,         /* create main configuration */
-    NULL,                                  /* init main configuration */
+    ngx_http_log_init_main_conf,           /* init main configuration */
 
     NULL,                                  /* create server configuration */
     NULL,                                  /* merge server configuration */
@@ -209,7 +211,7 @@ static ngx_http_module_t  ngx_http_log_module_ctx = {
 
 
 ngx_module_t  ngx_http_log_module = {
-    NGX_MODULE_V1,
+    NGX_MODULE_V1_FLAGS(NGX_HTTP_TENANT_CONF),
     &ngx_http_log_module_ctx,              /* module context */
     ngx_http_log_commands,                 /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
@@ -1244,6 +1246,14 @@ ngx_http_log_create_main_conf(ngx_conf_t *cf)
 
     ngx_http_log_fmt_t  *fmt;
 
+    /*
+     * The formats are a tenant's own, made here as the static configuration
+     * makes them: nothing in one is created outside the pool, so a tenant
+     * declares the formats it logs with and names no format of the
+     * operator's.  "combined" is made for it the same way, being what a
+     * log with no format named uses.
+     */
+
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_log_main_conf_t));
     if (conf == NULL) {
         return NULL;
@@ -1270,6 +1280,41 @@ ngx_http_log_create_main_conf(ngx_conf_t *cf)
     }
 
     return conf;
+}
+
+
+/*
+ * "combined" is compiled here rather than in postconfiguration(), which a
+ * tenant parse does not run: a tenant has formats of its own, and the one
+ * a log with no format named uses has to be among them.
+ */
+
+static char *
+ngx_http_log_init_main_conf(ngx_conf_t *cf, void *conf)
+{
+    ngx_http_log_main_conf_t *lmcf = conf;
+
+    ngx_str_t            *value;
+    ngx_array_t           a;
+    ngx_http_log_fmt_t   *fmt;
+
+    if (!lmcf->combined_used) {
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_array_init(&a, cf->pool, 1, sizeof(ngx_str_t)) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    value = ngx_array_push(&a);
+    if (value == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    *value = ngx_http_combined_fmt;
+    fmt = lmcf->formats.elts;
+
+    return ngx_http_log_compile_format(cf, NULL, fmt->ops, &a, 0);
 }
 
 
@@ -1399,6 +1444,18 @@ ngx_http_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     if (ngx_strncmp(value[1].data, "syslog:", 7) == 0) {
 
+        if (ngx_conf_tenant(cf)) {
+            /*
+             * A peer keeps the connection of the process that opened it,
+             * which another process could not use.
+             */
+
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "logging to syslog is not supported "
+                               "in a tenant");
+            return NGX_CONF_ERROR;
+        }
+
         peer = ngx_pcalloc(cf->pool, sizeof(ngx_syslog_peer_t));
         if (peer == NULL) {
             return NGX_CONF_ERROR;
@@ -1415,7 +1472,16 @@ ngx_http_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     n = ngx_http_script_variables_count(&value[1]);
 
-    if (n == 0) {
+    /*
+     * A tenant writes through the cache of its own worker rather than a
+     * descriptor the cycle holds: what the static configuration opened
+     * before the fork is all a descriptor of the cycle can be, and a tenant
+     * arrives after it.  A name with no variables in it is compiled the
+     * same way as one with them, which costs a copy of the name per
+     * request and opens the file through the inherited cache.
+     */
+
+    if (n == 0 && !ngx_conf_tenant(cf)) {
         log->file = ngx_conf_open_file(cf->cycle, &value[1]);
         if (log->file == NULL) {
             return NGX_CONF_ERROR;
@@ -1609,6 +1675,19 @@ process_formats:
             }
 
             return NGX_CONF_OK;
+        }
+
+        if (ngx_conf_tenant(cf)) {
+            /*
+             * The buffer belongs to the file, so it is shared by everything
+             * logging to it, and every process writes to it.  One a dynamic
+             * configuration creates would be in the zone.
+             */
+
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "no buffer for access_log \"%V\" is defined "
+                               "by the static configuration", &value[1]);
+            return NGX_CONF_ERROR;
         }
 
         buffer = ngx_pcalloc(cf->pool, sizeof(ngx_http_log_buf_t));
@@ -1876,13 +1955,44 @@ ngx_http_log_open_file_cache(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_log_loc_conf_t *llcf = conf;
 
-    time_t       inactive, valid;
-    ngx_str_t   *value, s;
-    ngx_int_t    max, min_uses;
-    ngx_uint_t   i;
+    time_t                    inactive, valid;
+    ngx_str_t                *value, s;
+    ngx_int_t                 max, min_uses;
+    ngx_uint_t                i;
+    ngx_http_log_loc_conf_t  *sllcf;
 
     if (llcf->open_file_cache != NGX_CONF_UNSET_PTR) {
         return "is duplicate";
+    }
+
+    if (cf->args->nelts == 1) {
+
+        /*
+         * A cache keeps the descriptors of one process, which a tenant
+         * cannot make: named with no parameters, it is the static one.
+         */
+
+        if (!ngx_conf_tenant(cf)) {
+            return "requires parameters outside a tenant";
+        }
+
+        sllcf = ngx_http_conf_get_module_static_loc_conf(cf,
+                                                        ngx_http_log_module);
+
+        if (sllcf->open_file_cache == NGX_CONF_UNSET_PTR) {
+            return "is not declared by the static configuration";
+        }
+
+        llcf->open_file_cache = sllcf->open_file_cache;
+        llcf->open_file_cache_valid = sllcf->open_file_cache_valid;
+        llcf->open_file_cache_min_uses = sllcf->open_file_cache_min_uses;
+
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_conf_tenant(cf)) {
+        return "cannot be created in a tenant, "
+               "only named with no parameters";
     }
 
     value = cf->args->elts;
@@ -1982,34 +2092,8 @@ ngx_http_log_open_file_cache(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 static ngx_int_t
 ngx_http_log_init(ngx_conf_t *cf)
 {
-    ngx_str_t                  *value;
-    ngx_array_t                 a;
     ngx_http_handler_pt        *h;
-    ngx_http_log_fmt_t         *fmt;
-    ngx_http_log_main_conf_t   *lmcf;
     ngx_http_core_main_conf_t  *cmcf;
-
-    lmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_log_module);
-
-    if (lmcf->combined_used) {
-        if (ngx_array_init(&a, cf->pool, 1, sizeof(ngx_str_t)) != NGX_OK) {
-            return NGX_ERROR;
-        }
-
-        value = ngx_array_push(&a);
-        if (value == NULL) {
-            return NGX_ERROR;
-        }
-
-        *value = ngx_http_combined_fmt;
-        fmt = lmcf->formats.elts;
-
-        if (ngx_http_log_compile_format(cf, NULL, fmt->ops, &a, 0)
-            != NGX_CONF_OK)
-        {
-            return NGX_ERROR;
-        }
-    }
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
