@@ -31,12 +31,15 @@ static ssize_t ngx_quic_stream_send(ngx_connection_t *c, u_char *buf,
     size_t size);
 static ngx_chain_t *ngx_quic_stream_send_chain(ngx_connection_t *c,
     ngx_chain_t *in, off_t limit);
-static ngx_int_t ngx_quic_stream_flush(ngx_quic_stream_t *qs);
 static void ngx_quic_stream_cleanup_handler(void *data);
 static ngx_int_t ngx_quic_close_stream(ngx_quic_stream_t *qs);
 static ngx_int_t ngx_quic_can_shutdown(ngx_connection_t *c);
 static ngx_int_t ngx_quic_control_flow(ngx_quic_stream_t *qs, uint64_t last);
 static ngx_int_t ngx_quic_update_flow(ngx_quic_stream_t *qs, uint64_t last);
+static void ngx_quic_unblock_flow(ngx_connection_t *c);
+static void ngx_quic_block_flow(ngx_connection_t *c);
+static uint64_t ngx_quic_get_flow(ngx_connection_t *c);
+static uint64_t ngx_quic_get_stream_flow(ngx_connection_t *c);
 static ngx_int_t ngx_quic_update_max_stream_data(ngx_quic_stream_t *qs);
 static ngx_int_t ngx_quic_update_max_data(ngx_connection_t *c);
 static void ngx_quic_set_event(ngx_event_t *ev);
@@ -288,8 +291,6 @@ ngx_quic_do_reset_stream(ngx_quic_stream_t *qs, ngx_uint_t err)
 
     ngx_quic_queue_frame(qc, frame);
 
-    ngx_quic_free_buffer(pc, &qs->send);
-
     return NGX_OK;
 }
 
@@ -316,9 +317,14 @@ ngx_quic_shutdown_stream(ngx_connection_t *c, int how)
 static ngx_int_t
 ngx_quic_shutdown_stream_send(ngx_connection_t *c)
 {
-    ngx_quic_stream_t  *qs;
+    ngx_connection_t       *pc;
+    ngx_quic_frame_t       *frame;
+    ngx_quic_stream_t      *qs;
+    ngx_quic_connection_t  *qc;
 
     qs = c->quic;
+    pc = qs->parent;
+    qc = ngx_quic_get_connection(pc);
 
     if (qs->send_state != NGX_QUIC_STREAM_SEND_READY
         && qs->send_state != NGX_QUIC_STREAM_SEND_SEND)
@@ -326,13 +332,32 @@ ngx_quic_shutdown_stream_send(ngx_connection_t *c)
         return NGX_OK;
     }
 
-    qs->send_state = NGX_QUIC_STREAM_SEND_SEND;
+    qs->send_state = NGX_QUIC_STREAM_SEND_DATA_SENT;
     qs->send_final_size = c->sent;
 
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, qs->parent->log, 0,
                    "quic stream id:0x%xL send shutdown", qs->id);
 
-    return ngx_quic_stream_flush(qs);
+    frame = ngx_quic_alloc_frame(pc);
+    if (frame == NULL) {
+        return NGX_ERROR;
+    }
+
+    frame->level = NGX_QUIC_ENCRYPTION_APPLICATION;
+    frame->type = NGX_QUIC_FT_STREAM;
+    frame->data = NULL;
+
+    frame->u.stream.off = 1;
+    frame->u.stream.len = 1;
+    frame->u.stream.fin = 1;
+
+    frame->u.stream.stream_id = qs->id;
+    frame->u.stream.offset = qs->send_offset;
+    frame->u.stream.length = 0;
+
+    ngx_quic_queue_frame(qc, frame);
+
+    return NGX_OK;
 }
 
 
@@ -951,9 +976,11 @@ ngx_quic_stream_send(ngx_connection_t *c, u_char *buf, size_t size)
 static ngx_chain_t *
 ngx_quic_stream_send_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
 {
-    uint64_t                n, flow;
+    uint64_t                n, flow, offset;
+    ngx_chain_t            *out;
     ngx_event_t            *wev;
     ngx_connection_t       *pc;
+    ngx_quic_frame_t       *frame;
     ngx_quic_stream_t      *qs;
     ngx_quic_connection_t  *qc;
 
@@ -971,9 +998,10 @@ ngx_quic_stream_send_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
 
     qs->send_state = NGX_QUIC_STREAM_SEND_SEND;
 
-    flow = qs->acked + qc->conf->stream_buffer_size - qs->sent;
+    flow = ngx_quic_get_stream_flow(c);
 
     if (flow == 0) {
+        ngx_quic_block_flow(c);
         wev->ready = 0;
         return in;
     }
@@ -982,84 +1010,39 @@ ngx_quic_stream_send_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
         limit = flow;
     }
 
-    n = qs->send.size;
+    n = qc->streams.send.size;
 
-    in = ngx_quic_write_buffer(pc, &qs->send, in, limit, qs->sent);
+    in = ngx_quic_write_buffer(pc, &qc->streams.send, in, limit,
+                               qc->streams.sent);
     if (in == NGX_CHAIN_ERROR) {
         return NGX_CHAIN_ERROR;
     }
 
-    n = qs->send.size - n;
+    n = qc->streams.send.size - n;
+
+    if (n == 0) {
+        return in;
+    }
+
     c->sent += n;
     qs->sent += n;
     qc->streams.sent += n;
 
-    if (flow == n) {
-        wev->ready = 0;
-    }
+    offset = qc->streams.send.offset;
 
-    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
-                   "quic send_chain sent:%uL", n);
-
-    if (ngx_quic_stream_flush(qs) != NGX_OK) {
+    out = ngx_quic_read_buffer(pc, &qc->streams.send, n);
+    if (out == NGX_CHAIN_ERROR) {
         return NGX_CHAIN_ERROR;
     }
 
-    return in;
-}
-
-
-static ngx_int_t
-ngx_quic_stream_flush(ngx_quic_stream_t *qs)
-{
-    off_t                   limit, len;
-    ngx_uint_t              last;
-    ngx_chain_t            *out;
-    ngx_quic_frame_t       *frame;
-    ngx_connection_t       *pc;
-    ngx_quic_connection_t  *qc;
-
-    if (qs->send_state != NGX_QUIC_STREAM_SEND_SEND) {
-        return NGX_OK;
-    }
-
-    pc = qs->parent;
-    qc = ngx_quic_get_connection(pc);
-
-    if (qc->streams.send_max_data == 0) {
-        qc->streams.send_max_data = qc->ctp.initial_max_data;
-    }
-
-    limit = ngx_min(qc->streams.send_max_data - qc->streams.send_offset,
-                    qs->send_max_data - qs->send_offset);
-
-    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, pc->log, 0,
-                   "quic stream id:0x%xL flush limit:%O", qs->id, limit);
-
-    len = qs->send.offset;
-
-    out = ngx_quic_read_buffer(pc, &qs->send, limit);
-    if (out == NGX_CHAIN_ERROR) {
-        return NGX_ERROR;
-    }
-
-    len = qs->send.offset - len;
-    last = 0;
-
-    if (qs->send_final_size != (uint64_t) -1
-        && qs->send_final_size == qs->send.offset)
-    {
-        qs->send_state = NGX_QUIC_STREAM_SEND_DATA_SENT;
-        last = 1;
-    }
-
-    if (len == 0 && !last) {
-        return NGX_OK;
+    if (qc->streams.send.offset != offset + n) {
+        ngx_quic_free_chain(pc, out);
+        return NGX_CHAIN_ERROR;
     }
 
     frame = ngx_quic_alloc_frame(pc);
     if (frame == NULL) {
-        return NGX_ERROR;
+        return NGX_CHAIN_ERROR;
     }
 
     frame->level = NGX_QUIC_ENCRYPTION_APPLICATION;
@@ -1068,26 +1051,26 @@ ngx_quic_stream_flush(ngx_quic_stream_t *qs)
 
     frame->u.stream.off = 1;
     frame->u.stream.len = 1;
-    frame->u.stream.fin = last;
+    frame->u.stream.fin = 0;
 
     frame->u.stream.stream_id = qs->id;
     frame->u.stream.offset = qs->send_offset;
-    frame->u.stream.length = len;
+    frame->u.stream.length = n;
 
     ngx_quic_queue_frame(qc, frame);
 
-    qs->send_offset += len;
-    qc->streams.send_offset += len;
+    qs->send_offset += n;
+    qc->streams.send_offset += n;
 
-    ngx_log_debug3(NGX_LOG_DEBUG_EVENT, pc->log, 0,
-                   "quic stream id:0x%xL flush len:%O last:%ui",
-                   qs->id, len, last);
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "quic send_chain sent:%uL", n);
 
-    if (qs->connection == NULL) {
-        return ngx_quic_close_stream(qs);
+    if (flow == n) {
+        ngx_quic_block_flow(c);
+        wev->ready = 0;
     }
 
-    return NGX_OK;
+    return in;
 }
 
 
@@ -1153,7 +1136,11 @@ ngx_quic_close_stream(ngx_quic_stream_t *qs)
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, pc->log, 0,
                    "quic stream id:0x%xL close", qs->id);
 
-    ngx_quic_free_buffer(pc, &qs->send);
+    if (qs->blocked) {
+        qs->blocked = 0;
+        ngx_queue_remove(&qs->queue);
+    }
+
     ngx_quic_free_buffer(pc, &qs->recv);
 
     ngx_rbtree_delete(&qc->streams.tree, &qs->node);
@@ -1320,38 +1307,17 @@ ngx_int_t
 ngx_quic_handle_max_data_frame(ngx_connection_t *c,
     ngx_quic_max_data_frame_t *f)
 {
-    ngx_rbtree_t           *tree;
-    ngx_rbtree_node_t      *node;
-    ngx_quic_stream_t      *qs;
     ngx_quic_connection_t  *qc;
 
     qc = ngx_quic_get_connection(c);
-    tree = &qc->streams.tree;
 
     if (f->max_data <= qc->streams.send_max_data) {
         return NGX_OK;
     }
 
-    if (tree->root == tree->sentinel
-        || qc->streams.send_offset < qc->streams.send_max_data)
-    {
-        /* not blocked on MAX_DATA */
-        qc->streams.send_max_data = f->max_data;
-        return NGX_OK;
-    }
-
     qc->streams.send_max_data = f->max_data;
-    node = ngx_rbtree_min(tree->root, tree->sentinel);
 
-    while (node && qc->streams.send_offset < qc->streams.send_max_data) {
-
-        qs = (ngx_quic_stream_t *) node;
-        node = ngx_rbtree_next(tree, node);
-
-        if (ngx_quic_stream_flush(qs) != NGX_OK) {
-            return NGX_ERROR;
-        }
-    }
+    ngx_quic_unblock_flow(c);
 
     return NGX_OK;
 }
@@ -1441,7 +1407,16 @@ ngx_quic_handle_max_stream_data_frame(ngx_connection_t *c,
 
     qs->send_max_data = f->limit;
 
-    return ngx_quic_stream_flush(qs);
+    if (qs->blocked
+        && qs->connection
+        && ngx_quic_get_stream_flow(qs->connection) > 0)
+    {
+        qs->blocked = 0;
+        ngx_queue_remove(&qs->queue);
+        ngx_quic_set_event(qs->connection->write);
+    }
+
+    return NGX_OK;
 }
 
 
@@ -1586,7 +1561,6 @@ ngx_quic_handle_max_streams_frame(ngx_connection_t *c,
 void
 ngx_quic_handle_stream_ack(ngx_connection_t *c, ngx_quic_frame_t *f)
 {
-    uint64_t                acked;
     ngx_quic_stream_t      *qs;
     ngx_quic_connection_t  *qc;
 
@@ -1616,8 +1590,8 @@ ngx_quic_handle_stream_ack(ngx_connection_t *c, ngx_quic_frame_t *f)
             return;
         }
 
-        acked = qs->acked;
         qs->acked += f->u.stream.length;
+        qc->streams.acked += f->u.stream.length;
 
         if (f->u.stream.fin) {
             qs->fin_acked = 1;
@@ -1634,11 +1608,8 @@ ngx_quic_handle_stream_ack(ngx_connection_t *c, ngx_quic_frame_t *f)
                        qs->id, f->u.stream.length, f->u.stream.fin,
                        qs->sent - qs->acked);
 
-        if (qs->connection
-            && qs->sent - acked == qc->conf->stream_buffer_size
-            && f->u.stream.length > 0)
-        {
-            ngx_quic_set_event(qs->connection->write);
+        if (f->u.stream.length > 0) {
+            ngx_quic_unblock_flow(c);
         }
 
         break;
@@ -1732,6 +1703,109 @@ ngx_quic_update_flow(ngx_quic_stream_t *qs, uint64_t last)
     }
 
     return NGX_OK;
+}
+
+
+static void
+ngx_quic_unblock_flow(ngx_connection_t *c)
+{
+    ngx_queue_t            *q;
+    ngx_quic_stream_t      *qs;
+    ngx_quic_connection_t  *qc;
+
+    if (ngx_quic_get_flow(c) == 0) {
+        return;
+    }
+
+    qc = ngx_quic_get_connection(c);
+
+    q = ngx_queue_head(&qc->streams.blocked);
+
+    while (q != ngx_queue_sentinel(&qc->streams.blocked)) {
+
+        qs = ngx_queue_data(q, ngx_quic_stream_t, queue);
+        q = ngx_queue_next(q);
+
+        if (qs->connection && qs->send_offset == qs->send_max_data) {
+            continue;
+        }
+
+        ngx_queue_remove(&qs->queue);
+        qs->blocked = 0;
+
+        if (qs->connection) {
+            ngx_quic_set_event(qs->connection->write);
+
+            ngx_log_debug0(NGX_LOG_DEBUG_EVENT, qs->connection->log, 0,
+                           "quic stream unblocked");
+        }
+    }
+}
+
+
+static void
+ngx_quic_block_flow(ngx_connection_t *c)
+{
+    ngx_connection_t       *pc;
+    ngx_quic_stream_t      *qs;
+    ngx_quic_connection_t  *qc;
+
+    qs = c->quic;
+
+    if (qs->blocked) {
+        return;
+    }
+
+    pc = qs->parent;
+    qc = ngx_quic_get_connection(pc);
+
+    ngx_queue_insert_tail(&qc->streams.blocked, &qs->queue);
+    qs->blocked = 1;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0, "quic stream blocked");
+}
+
+
+static uint64_t
+ngx_quic_get_flow(ngx_connection_t *c)
+{
+    uint64_t                window, max_window, flow1, flow2;
+    ngx_quic_connection_t  *qc;
+
+    qc = ngx_quic_get_connection(c);
+
+    if (qc->streams.send_max_data == 0) {
+        qc->streams.send_max_data = qc->ctp.initial_max_data;
+    }
+
+    window = qc->streams.sent - qc->streams.acked;
+    max_window = ngx_min(qc->streams.send_buffer, 2 * qc->congestion.window);
+
+    if (window >= max_window) {
+        return 0;
+    }
+
+    flow1 = max_window - window;
+    flow2 = qc->streams.send_max_data - qc->streams.send_offset;
+
+    return ngx_min(flow1, flow2);
+}
+
+
+static uint64_t
+ngx_quic_get_stream_flow(ngx_connection_t *c)
+{
+    uint64_t            flow1, flow2;
+    ngx_connection_t   *pc;
+    ngx_quic_stream_t  *qs;
+
+    qs = c->quic;
+    pc = qs->parent;
+
+    flow1 = ngx_quic_get_flow(pc);
+    flow2 = qs->send_max_data - qs->send_offset;
+
+    return ngx_min(flow1, flow2);
 }
 
 

@@ -149,13 +149,19 @@ typedef struct {
     ngx_rbtree_node_t                 sentinel;
 
     ngx_queue_t                       uninitialized;
+    ngx_queue_t                       blocked;
     ngx_queue_t                       free;
 
+    ngx_quic_buffer_t                 send;
+
     uint64_t                          sent;
+    uint64_t                          acked;
+    uint64_t                          recv_buffer;
     uint64_t                          recv_offset;
     uint64_t                          recv_window;
     uint64_t                          recv_last;
     uint64_t                          recv_max_data;
+    uint64_t                          send_buffer;
     uint64_t                          send_offset;
     uint64_t                          send_max_data;
 

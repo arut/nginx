@@ -16,6 +16,8 @@ static ngx_int_t ngx_http_v3_add_variables(ngx_conf_t *cf);
 static void *ngx_http_v3_create_srv_conf(ngx_conf_t *cf);
 static char *ngx_http_v3_merge_srv_conf(ngx_conf_t *cf, void *parent,
     void *child);
+static char *ngx_http_v3_obsolete(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static char *ngx_http_quic_host_key(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
@@ -45,10 +47,9 @@ static ngx_command_t  ngx_http_v3_commands[] = {
 
     { ngx_string("http3_stream_buffer_size"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_size_slot,
+      ngx_http_v3_obsolete,
       NGX_HTTP_SRV_CONF_OFFSET,
-      offsetof(ngx_http_v3_srv_conf_t, quic.stream_buffer_size),
-      &ngx_conf_size_nonzero_post },
+      0, NULL },
 
     { ngx_string("quic_retry"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
@@ -201,7 +202,8 @@ ngx_http_v3_create_srv_conf(ngx_conf_t *cf)
     h3scf->max_table_capacity = NGX_HTTP_V3_MAX_TABLE_CAPACITY;
     h3scf->max_concurrent_streams = NGX_CONF_UNSET_UINT;
 
-    h3scf->quic.stream_buffer_size = NGX_CONF_UNSET_SIZE;
+    h3scf->quic.send_buffer = NGX_HTTP_V3_SEND_BUFFER;
+    h3scf->quic.recv_buffer = NGX_HTTP_V3_RECV_BUFFER;
     h3scf->quic.max_concurrent_streams_bidi = NGX_CONF_UNSET_UINT;
     h3scf->quic.max_concurrent_streams_uni = NGX_HTTP_V3_MAX_UNI_STREAMS;
     h3scf->quic.retry = NGX_CONF_UNSET;
@@ -234,10 +236,6 @@ ngx_http_v3_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
                               prev->max_concurrent_streams, 128);
 
     conf->max_blocked_streams = conf->max_concurrent_streams;
-
-    ngx_conf_merge_size_value(conf->quic.stream_buffer_size,
-                              prev->quic.stream_buffer_size,
-                              65536);
 
     conf->quic.max_concurrent_streams_bidi = conf->max_concurrent_streams;
 
@@ -287,6 +285,16 @@ ngx_http_v3_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 
     sscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_ssl_module);
     conf->quic.ssl = &sscf->ssl;
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_http_v3_obsolete(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                       "the \"%V\" directive is obsolete, ignored", &cmd->name);
 
     return NGX_CONF_OK;
 }

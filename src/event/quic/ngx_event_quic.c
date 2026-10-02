@@ -304,7 +304,11 @@ ngx_quic_new_connection(ngx_connection_t *c, ngx_quic_conf_t *conf,
     ctp->active_connection_id_limit = 2;
 
     ngx_queue_init(&qc->streams.uninitialized);
+    ngx_queue_init(&qc->streams.blocked);
     ngx_queue_init(&qc->streams.free);
+
+    qc->streams.recv_buffer = conf->recv_buffer;
+    qc->streams.send_buffer = conf->send_buffer;
 
     qc->streams.recv_max_data = qc->tp.initial_max_data;
     qc->streams.recv_window = qc->streams.recv_max_data;
@@ -319,9 +323,7 @@ ngx_quic_new_connection(ngx_connection_t *c, ngx_quic_conf_t *conf,
     qc->congestion.mtu = NGX_QUIC_MIN_INITIAL_SIZE;
     qc->congestion.recovery_start = ngx_current_msec - 1;
 
-    qc->max_frames = (conf->max_concurrent_streams_uni
-                      + conf->max_concurrent_streams_bidi)
-                     * conf->stream_buffer_size / 2000;
+    qc->max_frames = (conf->recv_buffer + conf->send_buffer) / 2000;
     qc->max_frames = ngx_max(qc->max_frames, 10000);
 
     if (pkt->validated && pkt->retried) {
@@ -597,6 +599,8 @@ ngx_quic_close_connection(ngx_connection_t *c, ngx_int_t rc)
     }
 
     ngx_quic_keys_cleanup(qc->keys);
+
+    ngx_quic_free_buffer(c, &qc->streams.send);
 
     ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0, "quic close completed");
 

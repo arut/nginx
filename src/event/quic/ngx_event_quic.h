@@ -80,13 +80,14 @@ typedef struct {
 typedef struct {
     ngx_ssl_t                     *ssl;
 
+    size_t                         send_buffer;
+    size_t                         recv_buffer;
     ngx_flag_t                     retry;
     ngx_flag_t                     gso_enabled;
     ngx_flag_t                     disable_active_migration;
     ngx_msec_t                     handshake_timeout;
     ngx_msec_t                     idle_timeout;
     ngx_str_t                      host_key;
-    size_t                         stream_buffer_size;
     ngx_uint_t                     max_concurrent_streams_bidi;
     ngx_uint_t                     max_concurrent_streams_uni;
     ngx_uint_t                     active_connection_id_limit;
@@ -118,10 +119,10 @@ struct ngx_quic_stream_s {
     uint64_t                       recv_window;
     uint64_t                       recv_last;
     uint64_t                       recv_final_size;
-    ngx_quic_buffer_t              send;
     ngx_quic_buffer_t              recv;
     ngx_quic_stream_send_state_e   send_state;
     ngx_quic_stream_recv_state_e   recv_state;
+    unsigned                       blocked:1;
     unsigned                       cancelable:1;
     unsigned                       fin_acked:1;
 };

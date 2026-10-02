@@ -53,6 +53,8 @@
 #define NGX_HTTP_V3_STREAM_SERVER_DECODER          5
 #define NGX_HTTP_V3_MAX_KNOWN_STREAM               6
 #define NGX_HTTP_V3_MAX_UNI_STREAMS                3
+#define NGX_HTTP_V3_SEND_BUFFER                    4194304
+#define NGX_HTTP_V3_RECV_BUFFER                    1048576
 
 /* HTTP/3 errors */
 #define NGX_HTTP_V3_ERR_NO_ERROR                   0x100
