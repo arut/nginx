@@ -592,6 +592,10 @@ ngx_quic_close_connection(ngx_connection_t *c, ngx_int_t rc)
 
     ngx_quic_close_sockets(c);
 
+    for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
+        ngx_quic_discard_ctx(c, i);
+    }
+
     ngx_quic_keys_cleanup(qc->keys);
 
     ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0, "quic close completed");

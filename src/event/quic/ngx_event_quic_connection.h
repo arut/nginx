@@ -268,13 +268,11 @@ struct ngx_quic_connection_s {
 
     ngx_queue_t                       free_frames;
     ngx_buf_t                        *free_bufs;
-    ngx_buf_t                        *free_shadow_bufs;
 
     ngx_uint_t                        nframes;
     ngx_uint_t                        max_frames;
 #ifdef NGX_QUIC_DEBUG_ALLOC
     ngx_uint_t                        nbufs;
-    ngx_uint_t                        nshadowbufs;
 #endif
 
 #if (NGX_QUIC_OPENSSL_COMPAT)
