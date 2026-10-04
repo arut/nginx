@@ -149,9 +149,11 @@ typedef struct {
     ngx_rbtree_node_t                 sentinel;
 
     ngx_queue_t                       uninitialized;
+    ngx_queue_t                       blocked;
     ngx_queue_t                       free;
 
     uint64_t                          sent;
+    uint64_t                          acked;
     uint64_t                          recv_offset;
     uint64_t                          recv_window;
     uint64_t                          recv_last;
@@ -251,6 +253,7 @@ struct ngx_quic_connection_s {
     ngx_quic_conf_t                  *conf;
 
     ngx_event_t                       push;
+    ngx_event_t                       pull;
     ngx_event_t                       pto;
     ngx_event_t                       close;
     ngx_event_t                       path_validation;

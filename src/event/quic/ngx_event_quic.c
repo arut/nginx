@@ -277,6 +277,10 @@ ngx_quic_new_connection(ngx_connection_t *c, ngx_quic_conf_t *conf,
     qc->push.data = c;
     qc->push.handler = ngx_quic_push_handler;
 
+    qc->pull.log = c->log;
+    qc->pull.data = c;
+    qc->pull.handler = ngx_quic_pull_streams;
+
     qc->close.log = c->log;
     qc->close.data = c;
     qc->close.handler = ngx_quic_close_handler;
@@ -304,6 +308,7 @@ ngx_quic_new_connection(ngx_connection_t *c, ngx_quic_conf_t *conf,
     ctp->active_connection_id_limit = 2;
 
     ngx_queue_init(&qc->streams.uninitialized);
+    ngx_queue_init(&qc->streams.blocked);
     ngx_queue_init(&qc->streams.free);
 
     qc->streams.recv_max_data = qc->tp.initial_max_data;
@@ -566,6 +571,10 @@ ngx_quic_close_connection(ngx_connection_t *c, ngx_int_t rc)
         ngx_del_timer(&qc->push);
     }
 
+    if (qc->pull.timer_set) {
+        ngx_del_timer(&qc->pull);
+    }
+
     if (qc->pto.timer_set) {
         ngx_del_timer(&qc->pto);
     }
@@ -576,6 +585,10 @@ ngx_quic_close_connection(ngx_connection_t *c, ngx_int_t rc)
 
     if (qc->push.posted) {
         ngx_delete_posted_event(&qc->push);
+    }
+
+    if (qc->pull.posted) {
+        ngx_delete_posted_event(&qc->pull);
     }
 
     if (qc->key_update.posted) {

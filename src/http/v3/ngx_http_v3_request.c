@@ -1279,6 +1279,7 @@ ngx_http_v3_construct_cookie_header(ngx_http_request_t *r)
 ngx_int_t
 ngx_http_v3_read_request_body(ngx_http_request_t *r)
 {
+    off_t                      window;
     size_t                     preread;
     ngx_int_t                  rc;
     ngx_chain_t               *cl, out;
@@ -1326,6 +1327,21 @@ ngx_http_v3_read_request_body(ngx_http_request_t *r)
 
     rb->buf = ngx_create_temp_buf(r->pool, clcf->client_body_buffer_size);
     if (rb->buf == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /* the window never needs to exceed the request body; total buffering
+       is limited by the connection window */
+
+    window = clcf->client_max_body_size;
+
+    if (r->headers_in.content_length_n != -1
+        && (window == 0 || window > r->headers_in.content_length_n))
+    {
+        window = r->headers_in.content_length_n;
+    }
+
+    if (ngx_quic_set_recv_window(r->connection, (size_t) window) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
