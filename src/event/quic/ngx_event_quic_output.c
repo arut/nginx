@@ -286,7 +286,7 @@ ngx_quic_allow_segmentation(ngx_connection_t *c)
 
     qc = ngx_quic_get_connection(c);
 
-    if (!qc->conf->gso_enabled) {
+    if (!qc->conf->gso_enabled || qc->gso_disabled) {
         return 0;
     }
 
@@ -396,6 +396,12 @@ ngx_quic_create_segments(ngx_connection_t *c)
                 return NGX_ERROR;
             }
 
+            if (n == NGX_DECLINED) {
+                ngx_quic_revert_send(c, preserved_pnum);
+                ngx_post_event(&qc->push, &ngx_posted_events);
+                break;
+            }
+
             if (n == NGX_AGAIN) {
                 ngx_quic_revert_send(c, preserved_pnum);
                 ngx_add_timer(&qc->push, NGX_QUIC_SOCKET_RETRY_DELAY);
@@ -420,19 +426,23 @@ static ssize_t
 ngx_quic_send_segments(ngx_connection_t *c, u_char *buf, size_t len,
     struct sockaddr *sockaddr, socklen_t socklen, size_t segment)
 {
-    size_t           clen;
-    ssize_t          n;
-    uint16_t        *valp;
-    struct iovec     iov;
-    struct msghdr    msg;
-    struct cmsghdr  *cmsg;
+    size_t                  clen;
+    ssize_t                 n;
+    ngx_err_t               err;
+    uint16_t               *valp;
+    struct iovec            iov;
+    struct msghdr           msg;
+    struct cmsghdr         *cmsg;
+    ngx_quic_connection_t  *qc;
 
 #if (NGX_HAVE_ADDRINFO_CMSG)
-    char             msg_control[CMSG_SPACE(sizeof(uint16_t))
-                             + CMSG_SPACE(sizeof(ngx_addrinfo_t))];
+    char                    msg_control[CMSG_SPACE(sizeof(uint16_t))
+                                    + CMSG_SPACE(sizeof(ngx_addrinfo_t))];
 #else
-    char             msg_control[CMSG_SPACE(sizeof(uint16_t))];
+    char                    msg_control[CMSG_SPACE(sizeof(uint16_t))];
 #endif
+
+    qc = ngx_quic_get_connection(c);
 
     ngx_memzero(&msg, sizeof(struct msghdr));
     ngx_memzero(msg_control, sizeof(msg_control));
@@ -470,6 +480,22 @@ ngx_quic_send_segments(ngx_connection_t *c, u_char *buf, size_t len,
     msg.msg_controllen = clen;
 
     n = ngx_sendmsg(c, &msg, 0);
+
+    if (n == NGX_ERROR) {
+        err = ngx_socket_errno;
+
+        if (err == NGX_EINVAL) {
+            /* segmentation is not supported on this path */
+
+            qc->gso_disabled = 1;
+            c->write->error = 0;
+
+            return NGX_DECLINED;
+        }
+
+        return NGX_ERROR;
+    }
+
     if (n < 0) {
         return n;
     }

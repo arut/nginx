@@ -305,6 +305,7 @@ struct ngx_quic_connection_s {
     unsigned                          key_phase:1;
     unsigned                          validated:1;
     unsigned                          client_tp_done:1;
+    unsigned                          gso_disabled:1;
 
 #if (NGX_QUIC_OPENSSL_API)
     unsigned                          read_level:2;

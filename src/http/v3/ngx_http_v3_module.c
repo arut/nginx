@@ -242,7 +242,7 @@ ngx_http_v3_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     conf->quic.max_concurrent_streams_bidi = conf->max_concurrent_streams;
 
     ngx_conf_merge_value(conf->quic.retry, prev->quic.retry, 0);
-    ngx_conf_merge_value(conf->quic.gso_enabled, prev->quic.gso_enabled, 0);
+    ngx_conf_merge_value(conf->quic.gso_enabled, prev->quic.gso_enabled, 1);
 
     ngx_conf_merge_str_value(conf->quic.host_key, prev->quic.host_key, "");
 
