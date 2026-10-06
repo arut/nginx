@@ -407,13 +407,13 @@ ngx_quic_allow_segmentation(ngx_connection_t *c)
 
         bytes += f->len;
 
-        if (qc->congestion.in_flight + bytes >= qc->congestion.window) {
-            return 0;
-        }
-
         if (bytes > len * 3) {
             /* require at least ~3 full packets to batch */
             return 1;
+        }
+
+        if (qc->congestion.in_flight + bytes >= qc->congestion.window) {
+            return 0;
         }
     }
 
