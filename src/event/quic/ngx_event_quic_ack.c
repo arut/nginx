@@ -875,9 +875,6 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
 
     blocked = (cg->in_flight >= cg->window) ? 1 : 0;
 
-    cg->in_flight -= f->plen;
-    f->plen = 0;
-
     timer = f->send_time - cg->recovery_start;
 
     now = ngx_current_msec;
@@ -917,6 +914,9 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
                    now, cg->window, cg->in_flight);
 
 done:
+
+    cg->in_flight -= f->plen;
+    f->plen = 0;
 
     if (blocked && cg->in_flight < cg->window) {
         ngx_post_event(&qc->push, &ngx_posted_events);
