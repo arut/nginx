@@ -13,6 +13,9 @@
 #define NGX_QUIC_MAX_UDP_SEGMENT_BUF  65487 /* 65K - IPv6 header */
 #define NGX_QUIC_MAX_SEGMENTS            64 /* UDP_MAX_SEGMENTS */
 
+#define NGX_QUIC_PACING_INTERVAL          2 /* ms */
+#define NGX_QUIC_PACING_BURST            10 /* packets, initial window */
+
 #define NGX_QUIC_RETRY_TOKEN_LIFETIME     3 /* seconds */
 #define NGX_QUIC_NEW_TOKEN_LIFETIME     600 /* seconds */
 #define NGX_QUIC_RETRY_BUFFER_SIZE      256
@@ -48,6 +51,8 @@ static ngx_int_t ngx_quic_create_datagrams(ngx_connection_t *c);
 static void ngx_quic_commit_send(ngx_connection_t *c);
 static void ngx_quic_revert_send(ngx_connection_t *c,
     uint64_t preserved_pnum[NGX_QUIC_SEND_CTX_LAST]);
+static size_t ngx_quic_pacing_credit(ngx_connection_t *c);
+static ngx_msec_t ngx_quic_pacing_delay(ngx_connection_t *c);
 #if ((NGX_HAVE_UDP_SEGMENT) && (NGX_HAVE_MSGHDR_MSG_CONTROL))
 static ngx_uint_t ngx_quic_allow_segmentation(ngx_connection_t *c);
 static ngx_int_t ngx_quic_create_segments(ngx_connection_t *c);
@@ -82,6 +87,10 @@ ngx_quic_output(ngx_connection_t *c)
 
     in_flight = cg->in_flight;
 
+    if (qc->push.timer_set) {
+        ngx_del_timer(&qc->push);
+    }
+
 #if ((NGX_HAVE_UDP_SEGMENT) && (NGX_HAVE_MSGHDR_MSG_CONTROL))
     if (ngx_quic_allow_segmentation(c)) {
         rc = ngx_quic_create_segments(c);
@@ -114,11 +123,11 @@ ngx_quic_output(ngx_connection_t *c)
 static ngx_int_t
 ngx_quic_create_datagrams(ngx_connection_t *c)
 {
-    size_t                  len, min;
+    size_t                  len, credit, min;
     ssize_t                 n;
     u_char                 *p;
     uint64_t                preserved_pnum[NGX_QUIC_SEND_CTX_LAST];
-    ngx_uint_t              i, pad;
+    ngx_uint_t              i, pad, paced;
     ngx_quic_path_t        *path;
     ngx_quic_send_ctx_t    *ctx;
     ngx_quic_congestion_t  *cg;
@@ -132,6 +141,9 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
 #if (NGX_SUPPRESS_WARN)
     ngx_memzero(preserved_pnum, sizeof(preserved_pnum));
 #endif
+
+    credit = ngx_quic_pacing_credit(c);
+    paced = 0;
 
     do {
         p = dst;
@@ -159,8 +171,15 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
                 return NGX_OK;
             }
 
+            if (credit < cg->mtu && cg->in_flight < cg->window
+                && !ngx_queue_empty(&ctx->frames))
+            {
+                paced = 1;
+            }
+
             n = ngx_quic_output_packet(c, ctx, p, len, min,
-                                       cg->in_flight >= cg->window);
+                                       cg->in_flight >= cg->window
+                                       || credit < cg->mtu);
             if (n == NGX_ERROR) {
                 return NGX_ERROR;
             }
@@ -190,7 +209,14 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
 
         path->sent += len;
 
+        cg->pacing_credit -= ngx_min(cg->pacing_credit, len);
+        credit = cg->pacing_credit;
+
     } while (cg->in_flight < cg->window);
+
+    if (paced) {
+        ngx_add_timer(&qc->push, ngx_quic_pacing_delay(c));
+    }
 
     return NGX_OK;
 }
@@ -273,6 +299,69 @@ ngx_quic_revert_send(ngx_connection_t *c, uint64_t pnum[NGX_QUIC_SEND_CTX_LAST])
 }
 
 
+/* RFC 9002, Section 7.7.  Pacing; N = 1.25 */
+
+static size_t
+ngx_quic_pacing_credit(ngx_connection_t *c)
+{
+    size_t                  max;
+    ngx_msec_t              now, rtt, elapsed;
+    ngx_quic_congestion_t  *cg;
+    ngx_quic_connection_t  *qc;
+
+    qc = ngx_quic_get_connection(c);
+    cg = &qc->congestion;
+
+    if (qc->first_rtt == NGX_TIMER_INFINITE) {
+        /* no RTT samples yet */
+        return cg->window;
+    }
+
+    now = ngx_current_msec;
+    elapsed = now - cg->pacing_time;
+    cg->pacing_time = now;
+
+    rtt = ngx_max(qc->avg_rtt, 1);
+
+    /* bursts are limited to the initial window */
+
+    max = ngx_max((uint64_t) cg->window * NGX_QUIC_PACING_INTERVAL * 10
+                  / rtt / 8,
+                  NGX_QUIC_PACING_BURST * cg->mtu);
+
+    if ((ngx_msec_int_t) elapsed > 0) {
+        cg->pacing_credit += (uint64_t) cg->window * elapsed * 10 / rtt / 8;
+    }
+
+    if (cg->pacing_credit > max) {
+        cg->pacing_credit = max;
+    }
+
+    return cg->pacing_credit;
+}
+
+
+static ngx_msec_t
+ngx_quic_pacing_delay(ngx_connection_t *c)
+{
+    size_t                  need;
+    ngx_quic_congestion_t  *cg;
+    ngx_quic_connection_t  *qc;
+
+    qc = ngx_quic_get_connection(c);
+    cg = &qc->congestion;
+
+    need = NGX_QUIC_PACING_INTERVAL * cg->window * 10
+           / ngx_max(qc->avg_rtt, 1) / 8;
+
+    need = ngx_max(need, cg->mtu);
+    need -= ngx_min(cg->pacing_credit, need);
+
+    return ngx_max((uint64_t) need * ngx_max(qc->avg_rtt, 1) * 8 / 10
+                   / cg->window, 1);
+}
+
+
 #if ((NGX_HAVE_UDP_SEGMENT) && (NGX_HAVE_MSGHDR_MSG_CONTROL))
 
 static ngx_uint_t
@@ -335,10 +424,10 @@ ngx_quic_allow_segmentation(ngx_connection_t *c)
 static ngx_int_t
 ngx_quic_create_segments(ngx_connection_t *c)
 {
-    size_t                  len, segsize;
+    size_t                  len, credit, segsize;
     ssize_t                 n;
     u_char                 *p, *end;
-    ngx_uint_t              nseg, level;
+    ngx_uint_t              nseg, level, paced;
     ngx_quic_path_t        *path;
     ngx_quic_send_ctx_t    *ctx;
     ngx_quic_congestion_t  *cg;
@@ -361,6 +450,8 @@ ngx_quic_create_segments(ngx_connection_t *c)
     end = dst + sizeof(dst);
 
     nseg = 0;
+    paced = 0;
+    credit = ngx_quic_pacing_credit(c);
 
     level = ctx - qc->send_ctx;
     preserved_pnum[level] = ctx->pnum;
@@ -371,7 +462,14 @@ ngx_quic_create_segments(ngx_connection_t *c)
 
         if (len && cg->in_flight + (p - dst) < cg->window) {
 
-            n = ngx_quic_output_packet(c, ctx, p, len, len, 0);
+            if (credit < (size_t) (p - dst) + cg->mtu
+                && !ngx_queue_empty(&ctx->frames))
+            {
+                paced = 1;
+            }
+
+            n = ngx_quic_output_packet(c, ctx, p, len, len,
+                                       credit < (size_t) (p - dst) + cg->mtu);
             if (n == NGX_ERROR) {
                 return NGX_ERROR;
             }
@@ -412,10 +510,17 @@ ngx_quic_create_segments(ngx_connection_t *c)
 
             path->sent += n;
 
+            cg->pacing_credit -= ngx_min(cg->pacing_credit, (size_t) n);
+            credit = cg->pacing_credit;
+
             p = dst;
             nseg = 0;
             preserved_pnum[level] = ctx->pnum;
         }
+    }
+
+    if (paced) {
+        ngx_add_timer(&qc->push, ngx_quic_pacing_delay(c));
     }
 
     return NGX_OK;

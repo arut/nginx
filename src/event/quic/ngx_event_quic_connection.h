@@ -187,6 +187,8 @@ typedef struct {
     ngx_msec_t                        recovery_start;
     ngx_msec_t                        idle_start;
     ngx_msec_t                        k;
+    ngx_msec_t                        pacing_time;
+    size_t                            pacing_credit;
     ngx_uint_t                        idle; /* unsigned  idle:1; */
 } ngx_quic_congestion_t;
 
@@ -217,7 +219,6 @@ struct ngx_quic_send_ctx_s {
     uint64_t                          largest_range;
     uint64_t                          first_range;
     ngx_msec_t                        largest_received;
-    ngx_msec_t                        ack_delay_start;
     ngx_uint_t                        nranges;
     ngx_quic_ack_range_t              ranges[NGX_QUIC_MAX_RANGES];
     ngx_uint_t                        send_ack;

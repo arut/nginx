@@ -323,6 +323,7 @@ ngx_quic_new_connection(ngx_connection_t *c, ngx_quic_conf_t *conf,
     qc->congestion.ssthresh = (size_t) -1;
     qc->congestion.mtu = NGX_QUIC_MIN_INITIAL_SIZE;
     qc->congestion.recovery_start = ngx_current_msec - 1;
+    qc->congestion.pacing_time = ngx_current_msec;
 
     qc->max_frames = (conf->max_concurrent_streams_uni
                       + conf->max_concurrent_streams_bidi)
@@ -1047,7 +1048,10 @@ ngx_quic_handle_payload(ngx_connection_t *c, ngx_quic_header_t *pkt)
         if (!qc->path->validated) {
             qc->path->validated = 1;
             ngx_quic_path_dbg(c, "in handshake", qc->path);
-            ngx_post_event(&qc->push, &ngx_posted_events);
+
+            if (!qc->push.timer_set) {
+                ngx_post_event(&qc->push, &ngx_posted_events);
+            }
         }
     }
 

@@ -188,6 +188,7 @@ valid:
         qc->congestion.ssthresh = (size_t) -1;
         qc->congestion.mtu = NGX_QUIC_MIN_INITIAL_SIZE;
         qc->congestion.recovery_start = ngx_current_msec - 1;
+        qc->congestion.pacing_time = ngx_current_msec;
 
         ngx_quic_init_rtt(qc);
     }

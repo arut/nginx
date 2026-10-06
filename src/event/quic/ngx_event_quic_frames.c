@@ -294,7 +294,9 @@ ngx_quic_queue_frame(ngx_quic_connection_t *qc, ngx_quic_frame_t *frame)
         return;
     }
 
-    ngx_post_event(&qc->push, &ngx_posted_events);
+    if (!qc->push.timer_set) {
+        ngx_post_event(&qc->push, &ngx_posted_events);
+    }
 }
 
 
