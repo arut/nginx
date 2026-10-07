@@ -1785,7 +1785,8 @@ done:
 
         cscf = ngx_http_get_module_srv_conf(r, ngx_http_core_module);
 
-        rb->rest = (off_t) cscf->large_client_header_buffers.size;
+        rb->rest = ngx_max((off_t) st->length,
+                           (off_t) cscf->large_client_header_buffers.size);
     }
 
     rc = ngx_http_top_request_body_filter(r, out);
