@@ -102,6 +102,7 @@ static ngx_int_t ngx_http_proxy_rewrite(ngx_http_request_t *r,
 
 static ngx_int_t ngx_http_proxy_add_variables(ngx_conf_t *cf);
 static void *ngx_http_proxy_create_main_conf(ngx_conf_t *cf);
+static char *ngx_http_proxy_init_main_conf(ngx_conf_t *cf, void *conf);
 static void *ngx_http_proxy_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf,
     void *parent, void *child);
@@ -120,6 +121,8 @@ static char *ngx_http_proxy_cookie_path(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_proxy_cookie_flags(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_proxy_store(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_proxy_keepalive(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 #if (NGX_HTTP_CACHE)
 static char *ngx_http_proxy_cache(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -431,6 +434,20 @@ static ngx_command_t  ngx_http_proxy_commands[] = {
       offsetof(ngx_http_proxy_loc_conf_t, upstream.limit_rate),
       NULL },
 
+    { ngx_string("proxy_keepalive_cache"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_2MORE,
+      ngx_http_keepalive_cache_set_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_proxy_main_conf_t, keepalive_caches),
+      &ngx_http_proxy_module },
+
+    { ngx_string("proxy_keepalive"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_proxy_keepalive,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
 #if (NGX_HTTP_CACHE)
 
     { ngx_string("proxy_cache"),
@@ -728,7 +745,7 @@ static ngx_http_module_t  ngx_http_proxy_module_ctx = {
     NULL,                                  /* postconfiguration */
 
     ngx_http_proxy_create_main_conf,       /* create main configuration */
-    NULL,                                  /* init main configuration */
+    ngx_http_proxy_init_main_conf,         /* init main configuration */
 
     NULL,                                  /* create server configuration */
     NULL,                                  /* merge server configuration */
@@ -916,6 +933,8 @@ ngx_http_proxy_handler(ngx_http_request_t *r)
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
     }
+
+    u->keepalive_variant = (plcf->http_version << 1) | u->ssl;
 
     u->output.tag = (ngx_buf_tag_t) &ngx_http_proxy_module;
 
@@ -3524,7 +3543,23 @@ ngx_http_proxy_create_main_conf(ngx_conf_t *cf)
     }
 #endif
 
+    if (ngx_array_init(&conf->keepalive_caches, cf->pool, 4,
+                       sizeof(ngx_http_keepalive_cache_t *))
+        != NGX_OK)
+    {
+        return NULL;
+    }
+
     return conf;
+}
+
+
+static char *
+ngx_http_proxy_init_main_conf(ngx_conf_t *cf, void *conf)
+{
+    ngx_http_proxy_main_conf_t *pmcf = conf;
+
+    return ngx_http_keepalive_caches_init(cf, &pmcf->keepalive_caches);
 }
 
 
@@ -3634,6 +3669,8 @@ ngx_http_proxy_create_loc_conf(ngx_conf_t *cf)
     conf->ssl_verify_depth = NGX_CONF_UNSET_UINT;
     conf->ssl_conf_commands = NGX_CONF_UNSET_PTR;
 #endif
+
+    conf->upstream.keepalive_cache = NGX_CONF_UNSET_PTR;
 
     /* the hardcoded values */
     conf->upstream.cyclic_temp_file = 0;
@@ -3746,6 +3783,9 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_ptr_value(conf->upstream.limit_rate,
                               prev->upstream.limit_rate, NULL);
+
+    ngx_conf_merge_ptr_value(conf->upstream.keepalive_cache,
+                              prev->upstream.keepalive_cache, NULL);
 
     ngx_conf_merge_bufs_value(conf->upstream.bufs, prev->upstream.bufs,
                               8, ngx_pagesize);
@@ -5031,6 +5071,39 @@ ngx_http_proxy_store(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     sc.complete_values = 1;
 
     if (ngx_http_script_compile(&sc) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_http_proxy_keepalive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_proxy_loc_conf_t *plcf = conf;
+
+    ngx_str_t                   *value;
+    ngx_http_proxy_main_conf_t  *pmcf;
+
+    if (plcf->upstream.keepalive_cache != NGX_CONF_UNSET_PTR) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    if (ngx_strcmp(value[1].data, "off") == 0) {
+        plcf->upstream.keepalive_cache = NULL;
+        return NGX_CONF_OK;
+    }
+
+    pmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_proxy_module);
+
+    plcf->upstream.keepalive_cache =
+                     ngx_http_keepalive_cache_add(cf, &pmcf->keepalive_caches,
+                                                  &value[1],
+                                                  &ngx_http_proxy_module);
+    if (plcf->upstream.keepalive_cache == NULL) {
         return NGX_CONF_ERROR;
     }
 

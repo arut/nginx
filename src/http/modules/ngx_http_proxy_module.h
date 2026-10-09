@@ -16,6 +16,8 @@
 
 typedef struct {
     ngx_array_t                    caches;  /* ngx_http_file_cache_t * */
+    ngx_array_t                    keepalive_caches;
+                                         /* ngx_http_keepalive_cache_t * */
 } ngx_http_proxy_main_conf_t;
 
 

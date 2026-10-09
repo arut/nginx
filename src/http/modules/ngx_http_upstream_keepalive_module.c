@@ -175,6 +175,12 @@ ngx_http_upstream_init_keepalive_peer(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
+    /* a named keepalive cache, if configured, takes precedence */
+
+    if (r->upstream->conf->keepalive_cache) {
+        return NGX_OK;
+    }
+
     kp->conf = kcf;
     kp->upstream = r->upstream;
     kp->data = r->upstream->peer.data;

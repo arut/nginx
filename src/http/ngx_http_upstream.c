@@ -857,6 +857,12 @@ found:
         return;
     }
 
+    if (ngx_http_keepalive_init_peer(r, u) != NGX_OK) {
+        ngx_http_upstream_finalize_request(r, u,
+                                           NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
     u->peer.start_time = ngx_current_msec;
 
     if (u->conf->next_upstream_tries
@@ -1292,6 +1298,12 @@ ngx_http_upstream_resolve_handler(ngx_resolver_ctx_t *ctx)
 #endif
 
     if (ngx_http_upstream_create_round_robin_peer(r, ur) != NGX_OK) {
+        ngx_http_upstream_finalize_request(r, u,
+                                           NGX_HTTP_INTERNAL_SERVER_ERROR);
+        goto failed;
+    }
+
+    if (ngx_http_keepalive_init_peer(r, u) != NGX_OK) {
         ngx_http_upstream_finalize_request(r, u,
                                            NGX_HTTP_INTERNAL_SERVER_ERROR);
         goto failed;

@@ -263,7 +263,9 @@ typedef struct {
 
     ngx_str_t                        module;
 
-    NGX_COMPAT_BEGIN(5)
+    ngx_http_keepalive_cache_t      *keepalive_cache;
+
+    NGX_COMPAT_BEGIN(4)
     NGX_COMPAT_END
 } ngx_http_upstream_conf_t;
 
@@ -402,6 +404,8 @@ struct ngx_http_upstream_s {
     ngx_str_t                        ssl_name;
     ngx_str_t                        ssl_alpn_protocol;
 #endif
+
+    ngx_uint_t                       keepalive_variant;
 
     ngx_http_cleanup_pt             *cleanup;
 

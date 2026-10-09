@@ -259,6 +259,8 @@ ngx_http_proxy_v2_handler(ngx_http_request_t *r)
     ngx_str_set(&u->ssl_alpn_protocol, NGX_HTTP_V2_ALPN_PROTO);
 #endif
 
+    u->keepalive_variant = (plcf->http_version << 1) | u->ssl;
+
     u->output.tag = (ngx_buf_tag_t) &ngx_http_proxy_v2_module;
 
     u->conf = &plcf->upstream;
